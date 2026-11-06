@@ -182,6 +182,7 @@ class Mem:
         if not self.h:
             raise OSError('OpenProcess 失败(%d)，试试右键以管理员运行' % ctypes.get_last_error())
         self._regions = None
+        self._regions_t = 0.0  # 区域表上次重建时间
         self.hot = []          # 角色对象常驻的区域
         self.ref_hot = []      # HitVO 引用常驻的区域
 
@@ -222,7 +223,9 @@ class Mem:
                                            struct.pack('<d', val), 8, ctypes.byref(n)))
 
     def regions(self, refresh=False):
-        if self._regions is not None and not refresh:
+        # 每 2 秒重建一次：游戏后加载会不断提交新内存，旧表会漏掉这些区域
+        if (self._regions is not None and not refresh
+                and time.time() - self._regions_t < 2.0):
             return self._regions
         out, addr, mbi = [], 0, MBI()
         while k32.VirtualQueryEx(self.h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
@@ -236,6 +239,7 @@ class Mem:
                 break
             addr = nxt
         self._regions = out
+        self._regions_t = time.time()
         return out
 
     def find_bytes(self, pattern, limit=512, chunk=8 << 20, regions=None):
@@ -465,7 +469,7 @@ SLOW_EVERY = 3        # 每 N 个 tick 写一次招式倍率（0.1s * 3 = 0.3s�
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0"
+APP_VER = "1.0.1"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -804,7 +808,12 @@ class Engine:
         deep = time.time() - self._last_deep > 5.0
         if deep:
             self._last_deep = time.time()
-        for f in scan_fighters(self.mem, deep=deep):
+        found = scan_fighters(self.mem, deep=deep)
+        if not found:
+            # 一个都没有：可能是区域表过旧（游戏刚加载），重建后深扫一次
+            self.mem._regions = None
+            found = scan_fighters(self.mem, deep=True)
+        for f in found:
             if not self.alive(f):
                 continue
             if (self.mem.rd_d(f.addr + 8) or 0.0) <= 0.0:
@@ -1112,7 +1121,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0')
+        self.title('死神vs火影 Yk修改器 1.0.1')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
