@@ -646,7 +646,8 @@ SEARCH_GAP = 0.0      # 空槽搜索间隔（0 = 每个 tick 都找）
 LEARN_GAP = 0.5       # 招式表重抓节流（秒）
 LEARN_RETRY = 0.25    # 候选没学满时的重试节流（秒，越小锁定越快）
 LEARN_RETRY_EMPTY = 0.12  # 还有空槽时的重试节流：候补/新局优先尽快学满
-FULL_FALLBACK = 0.3   # 热点学不满时回退全堆的节流（秒）
+FULL_FALLBACK = 0.3   # 锁满稳态下热点学不满回退全堆的节流（秒）
+EMPTY_FULL_FALLBACK = 2.5  # 空槽期（静止真人）热点学不满时的全兜底节流，更保守避免抢找人 I/O
 GIL_YIELD_BYTES = 8 << 20   # 学习扫描每处理一块(8MB)就让出 GIL / 检查一次中止
 SLOW_GAP = 0.3        # 招式倍率写入间隔（秒）
 TICK_IDLE = 0.10      # 两边都锁住时的节拍
@@ -665,7 +666,7 @@ ACTIVE_MOVE_OFF = 0x78
 FAST_MOVE_HI = 30     # 快速判据硬上界：真角色动态值严格小于模板最小值
 TEMPLATE_FREQ = 4     # 频次法：同一 0x78 值出现这么多次即认定为模板值，版本漂移也能自适应
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
-APP_VER = "1.2.4"
+APP_VER = "1.2.5"
 
 
 # ------------------------------------------------------------------ 引擎
@@ -713,6 +714,7 @@ class Engine:
         self._last_deep = 0.0
         self._last_empty_deep = 0.0     # 初值0=启动首次全堆发现立即放行；之后由 2s 节流约束
         self._last_full_refresh = 0.0
+        self._last_empty_full_learn = 0.0   # 空槽期静止真人的全堆学习兜底节流
         self._last_search = 0.0
         self._last_slow = 0.0
         self._last_refresh_req = 0.0
@@ -757,6 +759,7 @@ class Engine:
         self._last_deep = time.time()
         self._last_empty_deep = time.time()
         self._last_full_refresh = 0.0
+        self._last_empty_full_learn = 0.0
         self._last_search = 0.0
         self._last_slow = 0.0
         self._last_refresh_req = 0.0
@@ -844,16 +847,25 @@ class Engine:
         refs = mem.find_values(owners, regions=zones)
         for f in fighters:
             self._learn(f, force=True, refs=refs.get(f.addr - OBJ_OFF, []))
-        # 全堆回退（~0.9s 的重 I/O）只在两人都锁满、进入稳态后才做；
-        # 有空槽说明正在锁人/补位，此刻全堆会和找人扫描抢 ReadProcessMemory，把锁定拖到半秒以上
+        # 全堆回退（~0.9s 的重 I/O）：
+        #  - 锁满稳态：高频节流 FULL_FALLBACK，且空槽一旦打开即协作式中止
+        #  - 空槽（静止真人靠招式兜底）：低频节流 EMPTY_FULL_FALLBACK，不挂 abort
+        #    （空槽期本来就需要这次发现，自我中止会让完全静止的角色永远学不满）
         slot_empty = self.locked[1] is None or self.locked[2] is None
-        if (not slot_empty
-                and any(len(f.hits) < MIN_HITS for f in fighters)
-                and time.time() - self._last_full_refresh > FULL_FALLBACK):
-            self._last_full_refresh = time.time()
-            # 空槽一旦打开就中止本次全堆：协作式取消，粒度=每 8MB 块，最多多扫一块
+        need_full = any(len(f.hits) < MIN_HITS for f in fighters)
+        now = time.time()
+        do_full = False
+        if not slot_empty and need_full and now - self._last_full_refresh > FULL_FALLBACK:
+            self._last_full_refresh = now
+            do_full = True
             refs = mem.find_values(
                 owners, abort=lambda: self.locked[1] is None or self.locked[2] is None)
+        elif (slot_empty and need_full
+              and now - self._last_empty_full_learn > EMPTY_FULL_FALLBACK):
+            self._last_empty_full_learn = now
+            do_full = True
+            refs = mem.find_values(owners)
+        if do_full:
             for addrs in refs.values():
                 for a in addrs:
                     for base, size in mem.regions():
@@ -892,14 +904,11 @@ class Engine:
                 time.sleep(0.1)
 
     def _learn_worker_loop(self):
-        """专责学招式表：含全堆扫描（可达 0.5s+），慢也不影响锁人，只服务攻击倍率写入。
-        有空槽（正在锁人/补位）时主动让路，把 ReadProcessMemory 带宽全留给找人扫描。"""
+        """专责学招式表：含全堆扫描（可达 0.5s+），慢也不影响锁人，只服务攻击倍率写入，
+        同时作为静止角色（帧间无变化、活性判据不触发）的锁定兜底。
+        空槽期仍执行候选学习，但只走热点/区域级轻量查找；全堆回退在 _refresh_hits 内部
+        已用 slot_empty 门控，不会在锁人/补位期间发起 ~0.9s 的重 I/O 抢带宽。"""
         while not self.stop:
-            # 空槽期间不学：快速判据(0x78)不需要招式表，学习只会抢 I/O 拖慢锁定
-            if self.locked[1] is None or self.locked[2] is None:
-                self._learn_wake.wait(0.05)
-                self._learn_wake.clear()
-                continue
             job = None
             if self._learn_req is not None:
                 job = (self._learn_req, self._gen)
@@ -1118,10 +1127,9 @@ class Engine:
             return False
         return f.alive_since is not None
 
-    def _fast_pick(self, cands):
-        """认出"当前这一局正在打"的真角色。
-        0x78 只负责排除模板池（固定值 0/30/61）；真正区分上一局残留与当前角色的是动态活性——
-        残留对象在非对局时 hp/x/qi 完全冻结，当前角色每帧都在变。频次法继续剔除版本模板值。"""
+    def _field_candidates(self, cands):
+        """第一关：用 0x78 做静态预筛，排除待命(0)与模板池(固定值30/61)。
+        频次法剔除反复出现的模板值，版本漂移也能自适应。返回通过预筛的战斗实例候选。"""
         vals = {}
         for f in cands:
             v = self._active_moves(f)
@@ -1131,12 +1139,21 @@ class Engine:
         out = []
         for v, fs in vals.items():
             if 1 <= v < FAST_MOVE_HI and v not in template_vals:
-                out.extend(f for f in fs if f.alive_since is not None)
+                out.extend(fs)
         return out
+
+    def _fast_pick(self, cands):
+        """第二关：在 0x78 预筛通过的战斗实例里，确认"属于当前对局"。
+        满足任一即认：① 已观测到帧间活性（角色在动，秒锁）；② 招式表学满 MIN_HITS
+        （角色静止待机、字段不变化时的兜底）。上一局残留既不运动、有效招式又≤2，两关都过不了。"""
+        return [f for f in self._field_candidates(cands)
+                if f.alive_since is not None or len(f.hits) >= MIN_HITS]
 
     def _assign(self, picked):
         """把通过判据的候选分配进空槽（按 x 坐标分 P1/P2），返回本次新锁的角色列表。"""
         empt = [t for t in (1, 2) if self.locked[t] is None]
+        if not empt or not picked:
+            return []                            # 两槽已满或无候选：无可分配，防止下标越界
         locked_now = []
         if len(empt) == 2:
             if len(picked) < 2:
@@ -1182,13 +1199,17 @@ class Engine:
         now = time.time()
         empt = [t for t in (1, 2) if self.locked[t] is None]
 
-        # —— 快速路径：0x78 排除模板 + 帧间活性排除上局残留，双条件都满足才锁 ——
-        # 先采样本帧活性（新对象这一帧只建基线，下一帧起才能确认变化），再挑选
-        self._observe_activity(cands)
+        # 第一关：0x78 静态预筛，只留战斗实例（排除待命 0、模板 30/61）
+        field = self._field_candidates(cands)
+        if not field:
+            return
+        # 帧间活性采样（新对象本帧只建基线）；运动角色下一到两个节拍即被确认
+        self._observe_activity(field)
+        # 第二关：已确认活性（在动，秒锁）或招式学满（静止待机，兜底）任一即锁
         fast = self._fast_pick(cands)
         if fast:
             self._assign(fast)
-            # 学习不挡锁人：锁上后把招式表学习丢后台，仅供攻击倍率写入用
+            # 锁上后把招式表学习丢后台，仅供攻击倍率写入用（活性秒锁的角色往往还没学满）
             need_learn = [f for f in fast
                           if len(f.hits) < MIN_HITS
                           and now - self._learnt.get(f.addr, 0) > LEARN_RETRY_EMPTY]
@@ -1197,17 +1218,15 @@ class Engine:
                 self._kick()
             return
 
-        # —— 兜底路径：快速判据没认出来（字段读不到/版本差异）时，退回 HitVO 学满 8 条 ——
+        # 兜底：静止角色活性不触发，靠后台学满 MIN_HITS 条招式来锁定。
+        # 只对通过 0x78 预筛的战斗实例学习，模板永远不进入这条链路
         gap = LEARN_RETRY_EMPTY if empt else LEARN_RETRY
-        need = [f for f in cands if len(f.hits) < MIN_HITS
+        need = [f for f in field if len(f.hits) < MIN_HITS
                 and now - self._learnt.get(f.addr, 0) > gap]
         if need and self._learn_req is None:
             self._learn_req = need
             self._kick()
             return                               # 等下一轮学完再锁
-        learned = [f for f in cands if len(f.hits) >= MIN_HITS]
-        if learned:
-            self._assign(learned)
 
     # ---------------- 旧的纯 HitVO 锁定路径已并入上方兜底分支 ----------------
 
@@ -1386,7 +1405,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.2.4')
+        self.title('死神vs火影 Yk修改器 1.2.5')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
