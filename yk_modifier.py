@@ -176,20 +176,22 @@ def find_flash_pid():
     return cands[0][0], cands[0][1], cands[0][2]
 
 
-_POOL = None
+_POOLS = {}            # key('scan'/'learn') -> ThreadPoolExecutor，两条链路物理隔离
 
 
-def _get_pool(need):
-    """模块级复用的扫描线程池；need 变大时扩一次容（只增不减，封顶 WORKERS）。"""
-    global _POOL
+def _get_pool(need, key='scan'):
+    """模块级复用的扫描线程池；need 变大时扩一次容（只增不减，封顶 WORKERS）。
+    scan / learn 用不同池，避免学习的全堆长任务占满线程、卡住找人扫描。"""
     import concurrent.futures as cf
     size = max(2, min(WORKERS, need))
-    if _POOL is None or getattr(_POOL, '_max_workers', 0) < size:
-        if _POOL is not None:
-            _POOL.shutdown(wait=False)
-        _POOL = cf.ThreadPoolExecutor(max_workers=size)
-        _POOL._max_workers = size
-    return _POOL
+    p = _POOLS.get(key)
+    if p is None or getattr(p, '_max_workers', 0) < size:
+        if p is not None:
+            p.shutdown(wait=False)
+        p = cf.ThreadPoolExecutor(max_workers=size, thread_name_prefix='pool-' + key)
+        p._max_workers = size
+        _POOLS[key] = p
+    return p
 
 
 class Mem:
@@ -203,7 +205,8 @@ class Mem:
         self._regions_t = 0.0  # 区域表上次重建时间
         self._start_time = self._proc_start_time(pid)
         self._hot_t = 0.0
-        self.hot = []          # 角色对象常驻的区域
+        self.hot = []          # 角色对象常驻的区域（FIFO，最近优先）
+        self.good_regions = [] # 验证过有 FighterMain 的区域，只增不轻易淘汰（廉价重试集）
         self.ref_hot = []      # HitVO 引用常驻的区域
         self._load_cache()
 
@@ -215,6 +218,10 @@ class Mem:
                     if len(self.hot) > 6:
                         self.hot.pop(0)
                     self._save_cache()
+                if (base, size) not in self.good_regions:
+                    self.good_regions.append((base, size))
+                    if len(self.good_regions) > 16:
+                        self.good_regions.pop(0)
                 return
 
     def scan_regions(self):
@@ -299,16 +306,16 @@ class Mem:
             sizes[i] += size
         return [b for b in buckets if b]
 
-    def _parallel(self, regions, fn, workers=None):
+    def _parallel(self, regions, fn, workers=None, pool_key='scan'):
         """把区域分组并行扫描，fn(区域列表) -> 局部结果，最后合并。
-        线程池模块级复用，避免每次扫描都创建/销毁一批线程（实测每次省 5~15ms）。"""
+        线程池按 scan/learn 物理隔离并复用，互不抢占。"""
         if not regions:
             return fn(regions)              # 空输入交给 fn，保持返回类型一致
         n = WORKERS if workers is None else workers
         if len(regions) <= 2 or n <= 1:
             return fn(regions)
         buckets = self._split(regions, n)
-        ex = _get_pool(len(buckets))
+        ex = _get_pool(len(buckets), pool_key)
         parts = list(ex.map(fn, buckets))
         if isinstance(parts[0], dict):
             merged = {}
@@ -341,7 +348,7 @@ class Mem:
         self._regions_t = time.time()
         return out
 
-    def find_bytes(self, pattern, limit=512, chunk=8 << 20, regions=None):
+    def find_bytes(self, pattern, limit=512, chunk=8 << 20, regions=None, abort=None):
         plen = len(pattern)
 
         def _scan(rs):
@@ -349,6 +356,8 @@ class Mem:
             for base, size in rs:
                 off = 0
                 while off < size:
+                    if abort is not None and abort():
+                        return hits            # 协作式中止：空槽打开，把带宽让回快扫
                     n = min(chunk, size - off)
                     data = self.read(base + off, n)
                     if data:
@@ -377,8 +386,10 @@ class Mem:
             return False
         return False
 
-    def find_values(self, values, chunk=8 << 20, regions=None):
-        """一次遍历，找出 values 里每个 u32 在内存中的所有出现位置 -> {value: [addr]}"""
+    def find_values(self, values, chunk=8 << 20, regions=None, yield_gil=True, abort=None):
+        """一次遍历，找出 values 里每个 u32 在内存中的所有出现位置 -> {value: [addr]}。
+        yield_gil=True 时定期让出 GIL，防止全堆扫描卡住高频找人线程。
+        abort() 返回 True 时协作式提前中止（空槽打开，把带宽让给找人扫描）。"""
         import numpy as _np
         vals = _np.array(sorted(set(values)), dtype='<u4')
         empty = {int(v): [] for v in vals}
@@ -387,6 +398,7 @@ class Mem:
 
         def _scan(rs):
             out = {int(v): [] for v in vals}
+            budget = 0
             for base, size in rs:
                 off = 0
                 while off < size:
@@ -400,9 +412,18 @@ class Mem:
                         for i in _np.nonzero(hit)[0]:
                             out[int(arr[i])].append(base + off + int(i) * 4)
                     off += n
+                    # 学习路径定期让出 GIL，避免全堆扫描把高频的找人扫描卡住
+                    if yield_gil:
+                        budget += n
+                        if budget >= GIL_YIELD_BYTES:
+                            budget = 0
+                            if abort is not None and abort():
+                                return out          # 空槽打开：中止全堆，立刻让带宽给找人
+                            time.sleep(0)
             return out
 
-        return self._parallel(regions if regions is not None else self.regions(), _scan)
+        return self._parallel(regions if regions is not None else self.regions(),
+                              _scan, pool_key='learn')
 
 
 SIG = bytes.fromhex('0000000000000040' + '0000000000408F40' * 2)   # 2.0, 1000.0, 1000.0（旧锚点，仅诊断用）
@@ -448,16 +469,26 @@ class Fighter:
         return None if self.qi_off is None else self.addr + self.qi_off
 
 
-def scan_fighters(mem, deep=False):
+def scan_fighters(mem, deep=False, abort=None):
     """以 qiMax=300 为锚点找 FighterMain，再做结构校验。
 
-    deep=False：只扫热点区域（几十毫秒），找不到才回退全堆
-    deep=True ：直接全堆扫描（~0.5 秒），用来兜住"新对象分配到别的区域"
+    deep=False：只扫热点 + 已验证区域（~10ms 级），扫空返回空，由上层决定要不要全堆发现。
+    deep=True ：直接全堆扫描，用来兜住"新对象分配到别的区域"，并把新区域记入 good_regions。
+    abort()=True 时全堆扫描协作式中止。
     """
-    passes = [None] if deep else ([mem.hot, None] if mem.hot else [None])
+    if deep:
+        passes = [None]
+    else:
+        passes = []
+        if mem.hot:
+            passes.append(mem.hot)
+        extra = [r for r in mem.good_regions if r not in mem.hot]
+        if extra:
+            passes.append(extra)
     for regions in passes:
         out, seen = [], set()
-        for x in mem.find_bytes(QMAX_SIG, limit=256, regions=regions):
+        pass_abort = abort if regions is None else None
+        for x in mem.find_bytes(QMAX_SIG, limit=256, regions=regions, abort=pass_abort):
             base = x - 0xC8
             if base < 0x10000 or base in seen:
                 continue
@@ -612,6 +643,7 @@ LEARN_GAP = 0.5       # 招式表重抓节流（秒）
 LEARN_RETRY = 0.25    # 候选没学满时的重试节流（秒，越小锁定越快）
 LEARN_RETRY_EMPTY = 0.12  # 还有空槽时的重试节流：候补/新局优先尽快学满
 FULL_FALLBACK = 0.3   # 热点学不满时回退全堆的节流（秒）
+GIL_YIELD_BYTES = 8 << 20   # 学习扫描每处理一块(8MB)就让出 GIL / 检查一次中止
 SLOW_GAP = 0.3        # 招式倍率写入间隔（秒）
 TICK_IDLE = 0.10      # 两边都锁住时的节拍
 TICK_SEARCH = 0.02    # 有空槽（找人/等对手）时的节拍
@@ -619,11 +651,17 @@ TICK_FAST = 0.015     # 有防御/气耗增益时的节拍（游戏每帧会重�
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.json')
 WORKERS = max(2, min(8, (os.cpu_count() or 4)))
 MIN_HITS = 8          # 锁定门槛：真角色都在 15 条以上，5~7 条多半是学了一半
-DEAD_DEBOUNCE = 0.3   # 连续这么久都不像活人，才判退场
+DEAD_DEBOUNCE = 0.12  # 连续这么久都不像活人，才判退场（配合 15ms 快节拍）
 DEATH_GRACE = 3.0     # 有人阵亡后的换局宽限：此期间不执行"单人骤减→退局"，给候补上场时间
 OBJ_OFF = 0x78        # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
+# FighterMain+0x78 处的 uint32：AS3 层维护的"当前激活招式数"。
+# 待命对象=0；静态模板池=固定值 30/61（每个模板全相同）；当前对局真角色=1..29 的动态值。
+# 读一个 int 即可判定谁在场上，省掉全堆扫 HitVO 引用（500ms+）→ 单次 4 字节读，约 0.05ms
+ACTIVE_MOVE_OFF = 0x78
+FAST_MOVE_HI = 30     # 快速判据硬上界：真角色动态值严格小于模板最小值
+TEMPLATE_FREQ = 4     # 频次法：同一 0x78 值出现这么多次即认定为模板值，版本漂移也能自适应
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
-APP_VER = "1.2.2"
+APP_VER = "1.2.3"
 
 
 # ------------------------------------------------------------------ 引擎
@@ -657,15 +695,19 @@ class Engine:
         self.pool = {}                 # addr -> Fighter（worker 维护）
         self.slot = {}                 # addr -> 1/2，一旦分配不再变
         self.locked = {1: None, 2: None}
-        # 后台任务请求（引擎置位，worker 消费）
+        # 后台任务请求（引擎置位，worker 消费）。两条独立 worker：
+        #   扫描 worker 只做找人（轻、高频，决定锁人速度）；
+        #   学习 worker 只做招式表（重、含全堆，仅供攻击倍率，慢也不挡锁人）
         self._scan_req = False
-        self._learn_req = None       # 搜索候选的学习（要尽快，影响锁定速度）
-        self._refresh_req = None     # 已锁定角色的周期刷新（1.5s 一次，可让位）
+        self._learn_req = None       # 搜索候选的学习
+        self._refresh_req = None     # 已锁定角色的周期刷新（1.5s 一次）
         self._scan_t = 0.0
-        self._wake = threading.Event()
+        self._scan_wake = threading.Event()
+        self._learn_wake = threading.Event()
         self._learnt = {}              # addr -> 最近一次学招式表的时间
         # 计时器 / 去抖
         self._last_deep = 0.0
+        self._last_empty_deep = 0.0     # 初值0=启动首次全堆发现立即放行；之后由 2s 节流约束
         self._last_full_refresh = 0.0
         self._last_search = 0.0
         self._last_slow = 0.0
@@ -682,7 +724,8 @@ class Engine:
         self._gen = 0
         self._beat = 0
         self._loop_on = False
-        self._worker_on = False
+        self._scan_on = False
+        self._learn_on = False
 
     # ---------------- 重置 ----------------
     def restart(self):
@@ -703,10 +746,12 @@ class Engine:
         self._learn_req = None
         self._refresh_req = None
         self._scan_t = 0.0
-        self._wake.set()
+        self._scan_wake.set()
+        self._learn_wake.set()
         self._learnt = {}
         # 重置后立刻起算深扫周期：否则 _last_deep=0 会让第一扫满足">12s"而走 700ms 深扫
         self._last_deep = time.time()
+        self._last_empty_deep = time.time()
         self._last_full_refresh = 0.0
         self._last_search = 0.0
         self._last_slow = 0.0
@@ -795,11 +840,16 @@ class Engine:
         refs = mem.find_values(owners, regions=zones)
         for f in fighters:
             self._learn(f, force=True, refs=refs.get(f.addr - OBJ_OFF, []))
-        # 热点不够：全堆补一次。空槽/换局时节流压到 FULL_FALLBACK，避免新 HitVO 落在新区域时干等
-        if any(len(f.hits) < MIN_HITS for f in fighters) and \
-                time.time() - self._last_full_refresh > FULL_FALLBACK:
+        # 全堆回退（~0.9s 的重 I/O）只在两人都锁满、进入稳态后才做；
+        # 有空槽说明正在锁人/补位，此刻全堆会和找人扫描抢 ReadProcessMemory，把锁定拖到半秒以上
+        slot_empty = self.locked[1] is None or self.locked[2] is None
+        if (not slot_empty
+                and any(len(f.hits) < MIN_HITS for f in fighters)
+                and time.time() - self._last_full_refresh > FULL_FALLBACK):
             self._last_full_refresh = time.time()
-            refs = mem.find_values(owners)
+            # 空槽一旦打开就中止本次全堆：协作式取消，粒度=每 8MB 块，最多多扫一块
+            refs = mem.find_values(
+                owners, abort=lambda: self.locked[1] is None or self.locked[2] is None)
             for addrs in refs.values():
                 for a in addrs:
                     for base, size in mem.regions():
@@ -813,55 +863,81 @@ class Engine:
             for f in fighters:
                 self._learn(f, force=True, refs=refs.get(f.addr - OBJ_OFF, []))
 
-    # ---------------- 后台线程 ----------------
+    # ---------------- 后台线程（扫描 / 学习 两条独立 worker） ----------------
     def _kick(self):
-        """唤醒 worker（Event.set 是原子的，重复调用无害）。"""
-        self._wake.set()
+        """唤醒对应 worker（Event.set 原子，重复调用无害）。"""
+        if self._scan_req:
+            self._scan_wake.set()
+        if self._learn_req is not None or self._refresh_req is not None:
+            self._learn_wake.set()
 
-    def _worker_loop(self):
+    def _scan_worker_loop(self):
+        """专责找人：任务轻（热点 ~36ms）、频率高，绝不能被全堆学习拖住。"""
         while not self.stop:
-            # 优先级：扫描 > 候选学习（决定锁定速度） > 锁定刷新
+            if not self._scan_req:
+                self._scan_wake.wait(0.03)
+                self._scan_wake.clear()
+                continue
+            self._scan_req = False
+            gen = self._gen
+            try:
+                if gen == self._gen and self.mem is not None:
+                    self._do_scan()
+            except Exception as e:
+                self.say('扫描任务失败: %r' % (e,))
+                time.sleep(0.1)
+
+    def _learn_worker_loop(self):
+        """专责学招式表：含全堆扫描（可达 0.5s+），慢也不影响锁人，只服务攻击倍率写入。
+        有空槽（正在锁人/补位）时主动让路，把 ReadProcessMemory 带宽全留给找人扫描。"""
+        while not self.stop:
+            # 空槽期间不学：快速判据(0x78)不需要招式表，学习只会抢 I/O 拖慢锁定
+            if self.locked[1] is None or self.locked[2] is None:
+                self._learn_wake.wait(0.05)
+                self._learn_wake.clear()
+                continue
             job = None
-            if self._scan_req:
-                self._scan_req = False
-                job = ('scan', None, self._gen)
-            elif self._learn_req is not None:
-                job = ('learn', self._learn_req, self._gen)
+            if self._learn_req is not None:
+                job = (self._learn_req, self._gen)
                 self._learn_req = None
             elif self._refresh_req is not None:
-                job = ('learn', self._refresh_req, self._gen)
+                job = (self._refresh_req, self._gen)
                 self._refresh_req = None
             if job is None:
-                self._wake.wait(0.05)           # 有任务立刻被唤醒，没任务最多等 50ms
-                self._wake.clear()
+                self._learn_wake.wait(0.1)
+                self._learn_wake.clear()
                 continue
+            fighters, gen = job
             try:
-                if job[2] != self._gen or self.mem is None:
-                    continue                    # 重置后的旧任务，直接丢
-                if job[0] == 'scan':
-                    self._do_scan()
-                else:
-                    self._refresh_hits(job[1])
+                if gen == self._gen and self.mem is not None:
+                    self._refresh_hits(fighters)
             except Exception as e:
-                self.say('后台任务失败: %r' % (e,))
+                self.say('学习任务失败: %r' % (e,))
                 time.sleep(0.1)
 
     def _do_scan(self):
-        """只找人，不抓招式表（热点 2~16ms，深扫约 0.5s）。"""
+        """只找人，不抓招式表。热点+已验证区域快扫（~10ms）；全堆发现按 2s 节流、
+        且空槽打开即可协作式中止，把 ~0.9s 的重 I/O 对锁人延迟的影响压到最低。"""
         mem = self.mem
         if not mem:
             return
-        t_start = time.time()
-        # 默认走热点（实测 36ms 能找全，和 700ms 深扫结果一致）；
-        # scan_fighters(deep=False) 内部在热点为空时会自动回退全堆。
-        # 深扫只在"两人都锁满"时按 12s 周期兜底；有空槽时绝不深扫，
-        # 否则 700ms 会占住唯一 worker，把更紧急的招式学习任务挡在后面
         slot_empty = self.locked[1] is None or self.locked[2] is None
-        deep = (not slot_empty) and time.time() - self._last_deep > 12.0
-        if deep:
+
+        # 1) 锁满后的周期深扫（12s）：空槽一旦打开就协作式中止，把带宽让给补位快扫
+        periodic_deep = (not slot_empty) and time.time() - self._last_deep > 12.0
+        if periodic_deep:
             self._last_deep = time.time()
-        found = scan_fighters(mem, deep=deep)
-        if not found:
+            found = scan_fighters(mem, deep=True,
+                                   abort=lambda: self.locked[1] is None or self.locked[2] is None)
+        else:
+            found = scan_fighters(mem, deep=False)
+
+        # 2) 结构有效且 hp>0 的候选。空槽时若一个有效候选都没有（shallow 只扫到错误热点里的
+        #    模板、真角色在未知区域），按节流做一次全堆"发现"。不能只看 found 是否为空——
+        #    模板也会让 found 非空，却永远锁不上，旧逻辑因此在冷缓存下卡死。
+        valid = [f for f in found
+                 if self._is_valid(mem, f) and (mem.rd_d(f.addr + 8) or 0.0) > 0.0]
+        if slot_empty and not valid:
             regs = mem.regions()
             if regs and mem.read(regs[0][0], 16) is None:
                 self.say('目标进程已退出，重新连接')
@@ -869,8 +945,11 @@ class Engine:
                     self.mem = None
                 self._conn_t = 0.0
                 return
-            mem._regions = None                 # 区域表可能过旧（游戏刚加载）
-            found = scan_fighters(mem, deep=True)
+            # 发现型全堆不挂 abort：它本就运行在空槽期，中止它等于永远发现不了新区域
+            if time.time() - self._last_empty_deep > 2.0:
+                self._last_empty_deep = time.time()
+                mem._regions = None
+                found = scan_fighters(mem, deep=True)
         pool = {}
         for f in found:
             if not self._is_valid(mem, f):
@@ -1000,32 +1079,35 @@ class Engine:
             self.say('本局结束（双方都已退场），等待下一局')
 
     # ---------------- 搜索 / 槽位分配（引擎线程，纯内存筛选） ----------------
-    def _search_step(self):
-        if not self.mem:
-            return
-        used = {f.addr for f in self.locked.values() if f is not None}
-        cands = [f for a, f in self.pool.items()
-                 if a not in used and self._live(f)]
-        if not cands:
-            return
-        now = time.time()
-        # 学不满的候选全部交给后台，不再限制数量、绝不同步扫描
-        gap = LEARN_RETRY_EMPTY if (self.locked[1] is None or self.locked[2] is None) else LEARN_RETRY
-        need = [f for f in cands if len(f.hits) < MIN_HITS
-                and now - self._learnt.get(f.addr, 0) > gap]
-        if need and self._learn_req is None:
-            self._learn_req = need
-            self._kick()
-            return                               # 等下一轮学完再锁
-        cands = [f for f in cands if len(f.hits) >= MIN_HITS]
-        if not cands:
-            return
+    def _active_moves(self, f):
+        """读 FighterMain+0x78 的当前激活招式数；读不到返回 None。"""
+        return self.mem.rd_i(f.addr + ACTIVE_MOVE_OFF)
+
+    def _fast_pick(self, cands):
+        """用 +0x78 字段直接认出当前对局真角色，不依赖全堆 HitVO 扫描。
+        双保险：① 硬区间 1..FAST_MOVE_HI-1（真角色动态值，模板固定值≥30）；
+        ② 频次法——同一值在候选里出现≥TEMPLATE_FREQ 次即判模板值并剔除，版本漂移也能自适应。"""
+        vals = {}
+        for f in cands:
+            v = self._active_moves(f)
+            if v is not None:
+                vals.setdefault(v, []).append(f)
+        template_vals = {v for v, fs in vals.items() if len(fs) >= TEMPLATE_FREQ}
+        out = []
+        for v, fs in vals.items():
+            if 1 <= v < FAST_MOVE_HI and v not in template_vals:
+                out.extend(fs)
+        return out
+
+    def _assign(self, picked):
+        """把通过判据的候选分配进空槽（按 x 坐标分 P1/P2），返回本次新锁的角色列表。"""
         empt = [t for t in (1, 2) if self.locked[t] is None]
+        locked_now = []
         if len(empt) == 2:
-            if len(cands) < 2:
-                return
-            cands.sort(key=lambda f: (len(f.hits), self.mem.rd_d(f.addr + 8) or 0), reverse=True)
-            a, b = cands[0], cands[1]
+            if len(picked) < 2:
+                return []                        # 两人都空时必须同时认齐，避免先锁模板
+            picked = sorted(picked, key=lambda f: self.mem.rd_d(f.addr + 0x30) or 0.0)
+            a, b = picked[0], picked[1]
             ax = self.mem.rd_d(a.addr + 0x30) or 0.0
             bx = self.mem.rd_d(b.addr + 0x30) or 0.0
             self.slot.clear()
@@ -1036,32 +1118,71 @@ class Engine:
             self.locked[1] = a if self.slot[a.addr] == 1 else b
             self.locked[2] = b if self.locked[1] is a else a
             p1, p2 = self.locked[1], self.locked[2]
-            self.say('锁定: P1=0x%08x(%d条,x=%.0f)  P2=0x%08x(%d条,x=%.0f)' % (
-                p1.addr, len(p1.hits), self.mem.rd_d(p1.addr + 0x30) or 0,
-                p2.addr, len(p2.hits), self.mem.rd_d(p2.addr + 0x30) or 0))
+            self.say('锁定: P1=0x%08x(招式%d,x=%.0f)  P2=0x%08x(招式%d,x=%.0f)' % (
+                p1.addr, self._active_moves(p1) or 0, self.mem.rd_d(p1.addr + 0x30) or 0,
+                p2.addr, self._active_moves(p2) or 0, self.mem.rd_d(p2.addr + 0x30) or 0))
+            locked_now = [p1, p2]
         else:
             t = empt[0]
-            best = max(cands, key=lambda f: len(f.hits))
+            best = max(picked, key=lambda f: self._active_moves(f) or 0)
             self.locked[t] = best
             self.slot[best.addr] = t
-            self.say('补位: P%d=0x%08x(%d条)' % (t, best.addr, len(best.hits)))
+            self.say('补位: P%d=0x%08x(招式%d)' % (t, best.addr, self._active_moves(best) or 0))
+            locked_now = [best]
+        for f in locked_now:
+            f.prev_qi = self.mem.rd_d(f.qi_addr)
+            f.peak_hits = max(f.peak_hits, len(f.hits))
+            f.drop_since = None
+            self._last_hp[f.addr] = self.mem.rd_d(f.addr + 8)
+        return locked_now
 
-        for f in (self.locked[1], self.locked[2]):
-            if f is not None:
-                f.prev_qi = self.mem.rd_d(f.qi_addr)
-                f.peak_hits = max(f.peak_hits, len(f.hits))   # 锁定即记峰值
-                f.drop_since = None                           # 清掉旧的骤减计时
-                self._last_hp[f.addr] = self.mem.rd_d(f.addr + 8)
+    def _search_step(self):
+        if not self.mem:
+            return
+        used = {f.addr for f in self.locked.values() if f is not None}
+        cands = [f for a, f in self.pool.items()
+                 if a not in used and self._live(f)]
+        if not cands:
+            return
+        now = time.time()
+        empt = [t for t in (1, 2) if self.locked[t] is None]
+
+        # —— 快速路径：0x78 字段直接判定，一次 4 字节读，无需等 HitVO 学满 ——
+        fast = self._fast_pick(cands)
+        if fast:
+            self._assign(fast)
+            # 学习不挡锁人：锁上后把招式表学习丢后台，仅供攻击倍率写入用
+            need_learn = [f for f in fast
+                          if len(f.hits) < MIN_HITS
+                          and now - self._learnt.get(f.addr, 0) > LEARN_RETRY_EMPTY]
+            if need_learn and self._learn_req is None:
+                self._learn_req = need_learn
+                self._kick()
+            return
+
+        # —— 兜底路径：快速判据没认出来（字段读不到/版本差异）时，退回 HitVO 学满 8 条 ——
+        gap = LEARN_RETRY_EMPTY if empt else LEARN_RETRY
+        need = [f for f in cands if len(f.hits) < MIN_HITS
+                and now - self._learnt.get(f.addr, 0) > gap]
+        if need and self._learn_req is None:
+            self._learn_req = need
+            self._kick()
+            return                               # 等下一轮学完再锁
+        learned = [f for f in cands if len(f.hits) >= MIN_HITS]
+        if learned:
+            self._assign(learned)
+
+    # ---------------- 旧的纯 HitVO 锁定路径已并入上方兜底分支 ----------------
 
     # ---------------- 引擎快节拍（15~100ms） ----------------
     def tick_fast(self):
         if not self.mem:
             return
         now = time.time()
-        # 1) 扫描请求：只要有空槽（阵亡候补 / 新局未锁满）就 50ms 快扫；
-        #    两人都锁满才降到 0.5s 一轮。旧代码只看池是否为空，池里有旧对象时会拖到 0.5s
+        # 1) 扫描请求：只要有空槽（阵亡候补 / 新局未锁满）就 30ms 快扫（接近一次热点
+        #    扫描的实际耗时，既不堆积请求也不空转烧 CPU）；两人锁满才降到 0.5s 一轮
         slot_empty = self.locked[1] is None or self.locked[2] is None
-        if self._scan_req is False and now - self._scan_t > (0.05 if slot_empty else 0.5):
+        if self._scan_req is False and now - self._scan_t > (0.03 if slot_empty else 0.5):
             self._scan_req = True
             self._kick()
         # 2) 锁定角色的招式表定期刷新（1.5s），走独立通道，不抢候选学习的槽
@@ -1182,9 +1303,12 @@ class Engine:
         if self._loop_on:
             return                                   # 只允许一个引擎线程
         self._loop_on = True
-        if not self._worker_on:
-            self._worker_on = True
-            threading.Thread(target=self._worker_loop, name='yk-worker', daemon=True).start()
+        if not self._scan_on:
+            self._scan_on = True
+            threading.Thread(target=self._scan_worker_loop, name='yk-scan', daemon=True).start()
+        if not self._learn_on:
+            self._learn_on = True
+            threading.Thread(target=self._learn_worker_loop, name='yk-learn', daemon=True).start()
         try:
             while not self.stop:
                 try:
@@ -1225,7 +1349,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.2.2')
+        self.title('死神vs火影 Yk修改器 1.2.3')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
