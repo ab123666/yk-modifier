@@ -2,3 +2,4 @@
 *.pyc
 *.pyo
 bvn_diag.txt
+yk_cache.json

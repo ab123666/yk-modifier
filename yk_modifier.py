@@ -26,6 +26,8 @@
 from __future__ import annotations
 
 import ctypes
+import os
+import json
 import ctypes.wintypes as wt
 import struct
 import sys
@@ -183,8 +185,11 @@ class Mem:
             raise OSError('OpenProcess 失败(%d)，试试右键以管理员运行' % ctypes.get_last_error())
         self._regions = None
         self._regions_t = 0.0  # 区域表上次重建时间
+        self._start_time = self._proc_start_time(pid)
+        self._hot_t = 0.0
         self.hot = []          # 角色对象常驻的区域
         self.ref_hot = []      # HitVO 引用常驻的区域
+        self._load_cache()
 
     def note_region(self, addr):
         for base, size in self.regions():
@@ -193,6 +198,7 @@ class Mem:
                     self.hot.append((base, size))
                     if len(self.hot) > 6:
                         self.hot.pop(0)
+                    self._save_cache()
                 return
 
     def scan_regions(self):
@@ -222,6 +228,81 @@ class Mem:
         return bool(k32.WriteProcessMemory(self.h, ctypes.c_void_p(addr),
                                            struct.pack('<d', val), 8, ctypes.byref(n)))
 
+    @staticmethod
+    def _proc_start_time(pid):
+        """进程创建时间（FILETIME 转成整数），用来区分"同一个进程"和"重启后的新进程" """
+        try:
+            k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return 0
+            c, e, k, u = (wt.FILETIME(), wt.FILETIME(), wt.FILETIME(), wt.FILETIME())
+            ok = k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e),
+                                     ctypes.byref(k), ctypes.byref(u))
+            k32.CloseHandle(h)
+            if not ok:
+                return 0
+            return (c.dwHighDateTime << 32) | c.dwLowDateTime
+        except Exception:
+            return 0
+
+    def _load_cache(self):
+        """只加载"同一个进程实例"留下的热区，否则丢弃"""
+        try:
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if data.get('pid') == self.pid and data.get('start') == self._start_time:
+                self.hot = [tuple(x) for x in data.get('hot', [])][:12]
+                self.ref_hot = [tuple(x) for x in data.get('ref_hot', [])][:16]
+        except Exception:
+            pass
+
+    def _save_cache(self):
+        """把热区写盘（最多每秒一次）"""
+        import time as _t
+        if _t.time() - self._hot_t < 1.0:
+            return
+        self._hot_t = _t.time()
+        try:
+            with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump({'pid': self.pid, 'start': self._start_time,
+                           'hot': self.hot, 'ref_hot': self.ref_hot}, f)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _split(regions, n):
+        """按字节数均衡切成 n 份"""
+        n = max(1, min(n, len(regions)))
+        buckets = [[] for _ in range(n)]
+        sizes = [0] * n
+        for base, size in sorted(regions, key=lambda r: -r[1]):
+            i = sizes.index(min(sizes))
+            buckets[i].append((base, size))
+            sizes[i] += size
+        return [b for b in buckets if b]
+
+    def _parallel(self, regions, fn, workers=None):
+        """把区域分组并行扫描，fn(区域列表) -> 局部结果，最后合并"""
+        n = WORKERS if workers is None else workers
+        if len(regions) <= 2 or n <= 1:
+            return fn(regions)
+        import concurrent.futures as cf
+        buckets = self._split(regions, n)
+        with cf.ThreadPoolExecutor(max_workers=len(buckets)) as ex:
+            parts = list(ex.map(fn, buckets))
+        if isinstance(parts[0], dict):
+            merged = {}
+            for part in parts:
+                for k, v in part.items():
+                    merged.setdefault(k, []).extend(v)
+            return merged
+        out = []
+        for part in parts:
+            out.extend(part)
+        return out
+
     def regions(self, refresh=False):
         # 每 2 秒重建一次：游戏后加载会不断提交新内存，旧表会漏掉这些区域
         if (self._regions is not None and not refresh
@@ -243,6 +324,32 @@ class Mem:
         return out
 
     def find_bytes(self, pattern, limit=512, chunk=8 << 20, regions=None):
+        plen = len(pattern)
+
+        def _scan(rs):
+            hits = []
+            for base, size in rs:
+                off = 0
+                while off < size:
+                    n = min(chunk, size - off)
+                    data = self.read(base + off, n)
+                    if data:
+                        i = data.find(pattern)
+                        while i >= 0:
+                            hits.append(base + off + i)
+                            if len(hits) >= limit:
+                                return hits
+                            i = data.find(pattern, i + 1)
+                        if n < chunk:
+                            break
+                        off += n - (plen - 1)
+                    else:
+                        off += n
+            return hits
+
+        return self._parallel(regions if regions is not None else self.regions(), _scan, 1)
+
+    def _find_bytes_old(self, pattern, limit=512, chunk=8 << 20, regions=None):
         hits, plen = [], len(pattern)
         for base, size in (regions if regions is not None else self.regions()):
             off = 0
@@ -279,23 +386,28 @@ class Mem:
         """一次遍历，找出 values 里每个 u32 在内存中的所有出现位置 -> {value: [addr]}"""
         import numpy as _np
         vals = _np.array(sorted(set(values)), dtype='<u4')
-        out = {int(v): [] for v in vals}
+        empty = {int(v): [] for v in vals}
         if not len(vals):
+            return empty
+
+        def _scan(rs):
+            out = {int(v): [] for v in vals}
+            for base, size in rs:
+                off = 0
+                while off < size:
+                    n = min(chunk, size - off)
+                    data = self.read(base + off, n)
+                    if data and len(data) >= 4:
+                        arr = _np.frombuffer(data[:len(data) // 4 * 4], dtype='<u4')
+                        pos = _np.searchsorted(vals, arr)
+                        _np.clip(pos, 0, len(vals) - 1, out=pos)
+                        hit = vals[pos] == arr
+                        for i in _np.nonzero(hit)[0]:
+                            out[int(arr[i])].append(base + off + int(i) * 4)
+                    off += n
             return out
-        for base, size in (regions if regions is not None else self.regions()):
-            off = 0
-            while off < size:
-                n = min(chunk, size - off)
-                data = self.read(base + off, n)
-                if data and len(data) >= 4:
-                    arr = _np.frombuffer(data[:len(data) // 4 * 4], dtype='<u4')
-                    pos = _np.searchsorted(vals, arr)
-                    _np.clip(pos, 0, len(vals) - 1, out=pos)
-                    hit = vals[pos] == arr
-                    for i in _np.nonzero(hit)[0]:
-                        out[int(arr[i])].append(base + off + int(i) * 4)
-                off += n
-        return out
+
+        return self._parallel(regions if regions is not None else self.regions(), _scan)
 
 
 SIG = bytes.fromhex('0000000000000040' + '0000000000408F40' * 2)   # 2.0, 1000.0, 1000.0（旧锚点，仅诊断用）
@@ -468,8 +580,11 @@ LEARN_GAP = 0.5       # 招式表重抓节流（秒）
 SLOW_EVERY = 3        # 每 N 个 tick 写一次招式倍率（0.1s * 3 = 0.3s）
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
 
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.json')
+WORKERS = max(2, min(8, (os.cpu_count() or 4)))
+
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.4"
+APP_VER = "1.0.5"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -782,6 +897,7 @@ class Engine:
                                 self.mem.ref_hot.append((base, size))
                                 if len(self.mem.ref_hot) > 12:
                                     self.mem.ref_hot.pop(0)
+                                self.mem._save_cache()
                             break
             for f in fighters:
                 self._learn(f, force=True, refs=refs.get(f.addr - OBJ_OFF, []))
@@ -1101,7 +1217,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.4')
+        self.title('死神vs火影 Yk修改器 1.0.5')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
