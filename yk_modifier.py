@@ -577,14 +577,16 @@ class Calibrator:
 SEARCH_GAP = 0.0      # 空槽搜索间隔（0 = 每个 tick 都找）
 SCAN_GAP = 0.1        # 扫描节流（秒），热点扫描只要 2ms
 LEARN_GAP = 0.5       # 招式表重抓节流（秒）
-SLOW_EVERY = 3        # 每 N 个 tick 写一次招式倍率（0.1s * 3 = 0.3s）
+SLOW_GAP = 0.3        # 招式倍率写入间隔（秒）
+TICK_IDLE = 0.10      # 两边都锁住时的节拍
+TICK_SEARCH = 0.02    # 有空槽（找人/等对手）时的节拍
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
 
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.json')
 WORKERS = max(2, min(8, (os.cpu_count() or 4)))
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.5"
+APP_VER = "1.0.7"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -768,6 +770,7 @@ class Engine:
         self._last_search = 0.0
         self._writes = 0
         self._writes_t0 = 0.0
+        self._last_slow = 0.0
         self._last_full_refresh = 0.0
         self._last_deep = 0.0
         self._last_hp = {}
@@ -794,6 +797,8 @@ class Engine:
         self._last_full_refresh = 0.0
         self._writes = 0
         self._writes_t0 = 0.0
+        self._last_slow = 0.0
+        self._conn_t = 0.0
         self.written_rates = {float(v) for v in range(1, 21)}
         self.status = '未连接'
         self.say('已重置：清空锁定与所有缓存，重新连接（等同重启修改器）')
@@ -806,6 +811,10 @@ class Engine:
 
     # ---- 连接 ----
     def connect(self):
+        # 连上之后每秒才重新检测一次（find_flash_pid 要枚举进程+模块，约 100ms）
+        if self.mem is not None and time.time() - self._conn_t < 1.0:
+            return True
+        self._conn_t = time.time()
         name, pid, dll = find_flash_pid()
         if not pid:
             self.status = '没找到 Flash 进程（开游戏；360se 需以管理员运行本工具）'
@@ -917,7 +926,7 @@ class Engine:
             return
         self._last_full = time.time()
         pool = {}
-        deep = time.time() - self._last_deep > 5.0
+        deep = time.time() - self._last_deep > 15.0
         if deep:
             self._last_deep = time.time()
         found = scan_fighters(self.mem, deep=deep)
@@ -1010,7 +1019,9 @@ class Engine:
                  if a not in used and self._live(f)]
         if not cands:
             return
-        need = [f for f in cands if len(f.hits) < 8]
+        _now = time.time()
+        need = [f for f in cands if len(f.hits) < 8
+                and _now - self._learnt.get(f.addr, 0) > 0.2][:3]
         if need:
             self._refresh_hits(need)          # 一次遍历，一次拿全部候选的招式数
         cands = [f for f in cands if len(f.hits) >= 5]
@@ -1198,15 +1209,18 @@ class Engine:
                     if time.time() - self._writes_t0 > 1.0:
                         self._writes_t0 = time.time()
                         self._writes = 0
-                    self.tick_fast()                       # 0.1s：判定 + 防御/气
-                    if self.fighters and n % SLOW_EVERY == 0:
+                    self.tick_fast()                       # 判定 + 防御/气
+                    if self.fighters and time.time() - self._last_slow > SLOW_GAP:
+                        self._last_slow = time.time()
                         self.tick_slow()                   # 0.3s：招式倍率
                 n += 1
             except Exception as e:
                 self.say('错误: %r' % (e,))
                 self.mem = None
                 time.sleep(1)
-            time.sleep(0.1)
+            # 有空槽就快跑（找人/等对手），两边都锁住就慢跑，省 CPU
+            searching = self.locked[1] is None or self.locked[2] is None
+            time.sleep(TICK_SEARCH if searching else TICK_IDLE)
 
 
 # ------------------------------------------------------------------ UI
@@ -1217,7 +1231,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.5')
+        self.title('死神vs火影 Yk修改器 1.0.7')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
