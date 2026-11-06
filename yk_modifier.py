@@ -586,7 +586,7 @@ CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.
 WORKERS = max(2, min(8, (os.cpu_count() or 4)))
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.8"
+APP_VER = "1.0.9"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -771,6 +771,8 @@ class Engine:
         self._writes = 0
         self._writes_t0 = 0.0
         self._last_slow = 0.0
+        self._conn_t = 0.0
+        self._both_drop_since = 0.0
         self._last_full_refresh = 0.0
         self._last_deep = 0.0
         self._last_hp = {}
@@ -799,6 +801,7 @@ class Engine:
         self._writes_t0 = 0.0
         self._last_slow = 0.0
         self._conn_t = 0.0
+        self._both_drop_since = 0.0
         self.written_rates = {float(v) for v in range(1, 21)}
         self.status = '未连接'
         self.say('已重置：清空锁定与所有缓存，重新连接（等同重启修改器）')
@@ -1015,6 +1018,27 @@ class Engine:
             else:
                 f.drop_since = None
 
+        # ---- 双方招式数同时骤减 → 判定退局（ESC 退出时不会掉血）----
+        if occupied == 2:
+            drops = []
+            for t in (1, 2):
+                f = self.locked[t]
+                n = len(f.hits)
+                ok = (f.peak_hits >= 10 and n <= max(3, f.peak_hits // 3))
+                drops.append(ok)
+            if all(drops):
+                if self._both_drop_since == 0.0:
+                    self._both_drop_since = now
+                elif now - self._both_drop_since > 3.0:
+                    self.say('双方招式数同时骤减并持续 3 秒 → 判定退局（可能是 ESC 退出）')
+                    self._release(1)
+                    self._release(2)
+                    self._both_drop_since = 0.0
+            else:
+                self._both_drop_since = 0.0
+        else:
+            self._both_drop_since = 0.0
+
         after = sum(1 for t in (1, 2) if self.locked[t] is not None)
         if before == 2 and after == 0:
             self.say('本局结束（双方都已退场），等待下一局')
@@ -1069,6 +1093,7 @@ class Engine:
             if f is not None:
                 f.prev_qi = self.mem.rd_d(f.qi_addr)
                 f.hit_time = 0.0
+                f.peak_hits = max(f.peak_hits, len(f.hits))   # 锁定即记录峰值，ESC 秒退也能判
                 self._last_hp[f.addr] = self.mem.rd_d(f.addr + 8)
                 self._still_since[f.addr] = time.time()
         self.tick_slow()
@@ -1241,7 +1266,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.8')
+        self.title('死神vs火影 Yk修改器 1.0.9')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
