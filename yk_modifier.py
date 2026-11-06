@@ -580,6 +580,7 @@ LEARN_GAP = 0.5       # 招式表重抓节流（秒）
 SLOW_GAP = 0.3        # 招式倍率写入间隔（秒）
 TICK_IDLE = 0.10      # 两边都锁住时的节拍
 TICK_SEARCH = 0.02    # 有空槽（找人/等对手）时的节拍
+TICK_FAST = 0.015     # 有防御/气耗增益时的节拍（游戏每帧会重置 defenseRate）
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
 
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.json')
@@ -588,7 +589,7 @@ MIN_HITS = 8          # 锁定门槛：真角色都在 15 条以上，5~7 条多
 DEAD_DEBOUNCE = 0.3   # 连续这么久都不像活人，才判退场
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.11"
+APP_VER = "1.0.12"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -1125,7 +1126,7 @@ MIN_HITS = 8          # 锁定门槛：真角色都在 15 条以上，5~7 条多
 DEAD_DEBOUNCE = 0.3   # 连续这么久都不像活人，才判退场
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.11"
+APP_VER = "1.0.12"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -1816,9 +1817,17 @@ class Engine:
                 self.say('错误: %r' % (e,))
                 self.mem = None
                 time.sleep(1)
-            # 有空槽就快跑（找人/等对手），两边都锁住就慢跑，省 CPU
+            # 有空槽就快跑（找人/等对手）；有防御/气耗增益时也要快跑（游戏每帧重置 defenseRate）
             searching = self.locked[1] is None or self.locked[2] is None
-            time.sleep(TICK_SEARCH if searching else TICK_IDLE)
+            boost = (any(v > 1.0001 for v in self.dfn.values())
+                     or any(v < 0.9999 for v in self.qi.values())
+                     or any(v > 1.0001 for v in self.atk.values()))
+            if searching:
+                time.sleep(TICK_SEARCH)
+            elif boost:
+                time.sleep(TICK_FAST)
+            else:
+                time.sleep(TICK_IDLE)
 
 
 # ------------------------------------------------------------------ UI
@@ -1829,7 +1838,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.11')
+        self.title('死神vs火影 Yk修改器 1.0.12')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
@@ -1953,6 +1962,23 @@ class App(tk.Tk):
             lines.append('  LOCKED 0x%08x team=%s hp=%s hits=%d name=%s' % (
                 f.addr, f.team, E.mem.rd_d(f.addr + 8) if E.mem else None,
                 len(f.hits), find_team_name(E.mem, f) if E.mem else None))
+        # ---- 写入链路自检：滑块值、结构校验、实际写入值 ----
+        if E.mem:
+            lines.append('')
+            lines.append('---- 写入链路 ----')
+            lines.append('滑块 atk=%s dfn=%s qi=%s' % (E.atk, E.dfn, E.qi))
+            for f in E.fighters:
+                team = 1 if f is E.locked[1] else 2
+                dr_cfg = defense_rate_for(E.dfn.get(team, 1.0))
+                dr_now = E.mem.rd_d(f.defrate_addr)
+                rates = {}
+                for pa, _pw in f.hits:
+                    cur = E.mem.rd_d(pa)
+                    key = round(cur, 2) if cur is not None else None
+                    rates[key] = rates.get(key, 0) + 1
+                top = sorted(rates.items(), key=lambda kv: -kv[1])[:3]
+                lines.append('  P%d 0x%08x 结构校验=%s  目标dr=%.2f  当前dr=%s  招式倍率分布=%s' % (
+                    team, f.addr, E._looks_like_fighter(f), dr_cfg, dr_now, top))
 
         if E.mem:
             E.mem._regions = None
