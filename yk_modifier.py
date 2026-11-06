@@ -657,7 +657,7 @@ DEAD_DEBOUNCE = 0.06  # 连续这么久读到 hp<=0 才判阵亡（仅滤瞬时�
 DROP_HOLD = 3.0       # 招式骤减判定退局需持续的秒数（单锁 / 双锁通用）
 OBJ_OFF = 0x78        # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
-APP_VER = "1.1.1"
+APP_VER = "1.1.2"
 
 
 # ------------------------------------------------------------------ 引擎
@@ -945,16 +945,16 @@ class Engine:
         else:
             found = scan_fighters(mem, deep=False)
 
-        # 2) 结构有效且 hp>0 的候选。空槽时若热点区域里没有任何"招式已达标"的角色
-        #    （含两种冷场景：① 一个有效候选都没有；② 只有旧区域残留，结构有效、hp>0 但招式
-        #    永远只有 0~2 条，而真角色已分配到全新内存区域、热点根本扫不到），按节流做一次
-        #    全堆"发现"。只看 valid 是否为空会被残留对象卡死，必须看是否有人真正能锁。
+        # 2) 结构有效且 hp>0 的候选。空槽时若当前没有任何"真正能锁"的角色（_live 且缓存招式
+        #    达标，与 _search_step 同口径），按节流做一次全堆"发现"。注意必须用 _live 口径而非
+        #    全部 valid：长时间运行后，旧代次残留对象可能在上一局还是活角色时缓存过 ≥8 条招式，
+        #    变成"陈旧但缓存丰富"的尸体；若把它们也算达标，全堆发现会被永久卡死，新区域真人扫不到。
         valid = [f for f in found
                  if self._is_valid(mem, f) and (mem.rd_d(f.addr + 8) or 0.0) > 0.0]
-        no_qualified = all(
-            len(self.learn_cache.get(f.addr, {}).get('hitmap', ())) < MIN_HITS
-            for f in valid)
-        if slot_empty and (not valid or no_qualified):
+        qualified = [f for f in valid
+                     if self._live(f)
+                     and len(self.learn_cache.get(f.addr, {}).get('hitmap', ())) >= MIN_HITS]
+        if slot_empty and (not valid or not qualified):
             regs = mem.regions()
             if regs and mem.read(regs[0][0], 16) is None:
                 self.say('目标进程已退出，重新连接')
@@ -987,6 +987,11 @@ class Engine:
         if self.mem is mem:                     # 期间没被重置才发布
             self.pool = pool                    # 原子整体替换
             self._scan_t = time.time()
+            # 修剪持久学习缓存：只保留当前仍扫得到的对象，防止跨局残留的旧缓存长期堆积、
+            # 进而在全堆发现门控里冒充"已达标"角色把新区域真人挡在外面
+            live_addrs = set(pool)
+            for a in [a for a in self.learn_cache if a not in live_addrs]:
+                del self.learn_cache[a]
 
     @staticmethod
     def _is_valid(mem, f):
@@ -1323,7 +1328,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.1.1')
+        self.title('死神vs火影 Yk修改器 1.1.2')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
