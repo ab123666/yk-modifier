@@ -469,7 +469,7 @@ SLOW_EVERY = 3        # 每 N 个 tick 写一次招式倍率（0.1s * 3 = 0.3s�
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.2"
+APP_VER = "1.0.3"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -641,8 +641,6 @@ class Engine:
         self.atk = {1: 1.0, 2: 1.0}
         self.dfn = {1: 1.0, 2: 1.0}
         self.qi = {1: 1.0, 2: 1.0}
-        self.auto = True
-        self.dfn_only = False      # True = 只写防御/气耗，不写招式倍率
         self.written_rates = {float(v) for v in range(1, 21)}  # 攻击滑块能产出的整数倍率
         self.swap = False
         self._hitmax = {}
@@ -931,8 +929,7 @@ class Engine:
                 f.hit_time = 0.0
                 self._last_hp[f.addr] = self.mem.rd_d(f.addr + 8)
                 self._still_since[f.addr] = time.time()
-        if self.auto:
-            self.tick_slow()
+        self.tick_slow()
 
     # ---- 每 0.1s ----
     def tick_fast(self):
@@ -972,8 +969,7 @@ class Engine:
 
         if not self.fighters:
             return
-        if self.auto:
-            self._write_fast(self.fighters)
+        self._write_fast(self.fighters)
 
     def _looks_like_fighter(self, f):
         """写之前的结构校验：hpMax 合理、qiMax≈300、heavy 1~10"""
@@ -1032,7 +1028,7 @@ class Engine:
 
     # ---- 每 0.3s ----
     def tick_slow(self):
-        if not self.mem or not self.fighters or self.dfn_only:
+        if not self.mem or not self.fighters:
             return
         for f in self.fighters:
             self._touch(f)
@@ -1079,7 +1075,7 @@ class Engine:
                         self._writes_t0 = time.time()
                         self._writes = 0
                     self.tick_fast()                       # 0.1s：判定 + 防御/气
-                    if self.auto and self.fighters and n % SLOW_EVERY == 0:
+                    if self.fighters and n % SLOW_EVERY == 0:
                         self.tick_slow()                   # 0.3s：招式倍率
                 n += 1
             except Exception as e:
@@ -1097,7 +1093,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.2')
+        self.title('死神vs火影 Yk修改器 1.0.3')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
@@ -1130,12 +1126,6 @@ class App(tk.Tk):
 
         bar = ttk.Frame(self)
         bar.pack(fill='x', padx=12, pady=4)
-        self.v_auto = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar, text='自动应用', variable=self.v_auto,
-                        command=lambda: setattr(self.eng, 'auto', self.v_auto.get())).pack(side='left')
-        self.v_safe = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text='只写防御', variable=self.v_safe,
-                        command=lambda: setattr(self.eng, 'dfn_only', self.v_safe.get())).pack(side='left', padx=8)
         ttk.Button(bar, text='全部重置', command=self.reset).pack(side='right', padx=6)
         ttk.Button(bar, text='重扫', command=self.rescan).pack(side='right')
         ttk.Button(bar, text='导出诊断', command=self.diag).pack(side='right', padx=6)
