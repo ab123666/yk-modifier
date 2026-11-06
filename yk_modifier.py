@@ -469,7 +469,7 @@ SLOW_EVERY = 3        # 每 N 个 tick 写一次招式倍率（0.1s * 3 = 0.3s�
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.1"
+APP_VER = "1.0.2"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -657,7 +657,6 @@ class Engine:
         self._writes_t0 = 0.0
         self._last_full_refresh = 0.0
         self._last_deep = 0.0
-        self.slot_prev = {1: (None, 0.0, None), 2: (None, 0.0, None)}  # 槽 -> (地址, 时间, 特征)
         self._last_hp = {}
         self._still_since = {}
         self.first_x = {}       # addr -> 第一次见到时的 x（≈出生位）
@@ -671,7 +670,6 @@ class Engine:
         self.fighters = []
         self.locked = {1: None, 2: None}
         self.slot = {}
-        self.slot_prev = {1: (None, 0.0, None), 2: (None, 0.0, None)}
         self.pool = {}
         self.cands = []
         self.first_x = {}
@@ -832,17 +830,9 @@ class Engine:
             return False
         return hp > 0.0 and x > 0.5
 
-    def _fingerprint(self, addr):
-        """对象特征：体重 + 血量上限（同一个角色的这两个值固定）"""
-        hv = self.mem.rd_d(addr) if self.mem else None
-        mx = self.mem.rd_d(addr + 0x10) if self.mem else None
-        return (round(hv, 3) if hv is not None else None,
-                round(mx, 1) if mx is not None else None)
-
     def _release(self, team):
         f = self.locked.get(team)
         if f is not None:
-            self.slot_prev[team] = (f.addr, time.time(), self._fingerprint(f.addr))
             self.slot.pop(f.addr, None)
             self.pool.pop(f.addr, None)      # 踢出候选池，强制下次重新扫描+学习
             f.hits = []
@@ -897,18 +887,8 @@ class Engine:
         """搜索态：找"活人里招式表最全的"，两格都空时按 x 分 P1/P2"""
         self._full_scan()
         used = {f.addr for f in self.locked.values() if f is not None}
-        now_ts = time.time()
-        prev = {}
-        for a, ts, fp in self.slot_prev.values():
-            if a and now_ts - ts < 10.0:
-                prev[a] = fp
-        cands = []
-        for a, f in self.pool.items():
-            if a in used or not self._live(f):
-                continue
-            if a in prev and self._fingerprint(a) == prev[a]:
-                continue          # 同一个地址 + 同一个特征 → 还是那个旧对象
-            cands.append(f)
+        cands = [f for a, f in self.pool.items()
+                 if a not in used and self._live(f)]
         if not cands:
             return
         need = [f for f in cands if len(f.hits) < 8]
@@ -945,10 +925,6 @@ class Engine:
             self.slot[best.addr] = t
             self.say('补位: P%d=0x%08x(%d条)' % (t, best.addr, len(best.hits)))
 
-        for t in (1, 2):
-            if self.locked[t] is not None:
-                self.slot_prev[t] = (self.locked[t].addr, time.time(),
-                                     self._fingerprint(self.locked[t].addr))
         for f in (self.locked[1], self.locked[2]):
             if f is not None:
                 f.prev_qi = self.mem.rd_d(f.qi_addr)
@@ -1121,7 +1097,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.1')
+        self.title('死神vs火影 Yk修改器 1.0.2')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
