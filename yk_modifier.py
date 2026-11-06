@@ -584,9 +584,11 @@ UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
 
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.json')
 WORKERS = max(2, min(8, (os.cpu_count() or 4)))
+MIN_HITS = 8          # 锁定门槛：真角色都在 15 条以上，5~7 条多半是学了一半
+DEAD_DEBOUNCE = 0.3   # 连续这么久都不像活人，才判退场
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.10"
+APP_VER = "1.0.11"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -774,6 +776,544 @@ class Engine:
         self._conn_t = 0.0
         self._both_drop_since = 0.0
         self._reset_req = False
+        self._dead_since = {}
+        self._last_full_refresh = 0.0
+        self._last_deep = 0.0
+        self._last_hp = {}
+        self._still_since = {}
+        self.first_x = {}       # addr -> 第一次见到时的 x（≈出生位）
+        self._learnt = {}
+
+    def _load_cache(self):
+        """只加载"同一个进程实例"留下的热区，否则丢弃"""
+        try:
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if data.get('pid') == self.pid and data.get('start') == self._start_time:
+                self.hot = [tuple(x) for x in data.get('hot', [])][:12]
+                self.ref_hot = [tuple(x) for x in data.get('ref_hot', [])][:16]
+        except Exception:
+            pass
+
+    def _save_cache(self):
+        """把热区写盘（最多每秒一次）"""
+        import time as _t
+        if _t.time() - self._hot_t < 1.0:
+            return
+        self._hot_t = _t.time()
+        try:
+            with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump({'pid': self.pid, 'start': self._start_time,
+                           'hot': self.hot, 'ref_hot': self.ref_hot}, f)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _split(regions, n):
+        """按字节数均衡切成 n 份"""
+        n = max(1, min(n, len(regions)))
+        buckets = [[] for _ in range(n)]
+        sizes = [0] * n
+        for base, size in sorted(regions, key=lambda r: -r[1]):
+            i = sizes.index(min(sizes))
+            buckets[i].append((base, size))
+            sizes[i] += size
+        return [b for b in buckets if b]
+
+    def _parallel(self, regions, fn, workers=None):
+        """把区域分组并行扫描，fn(区域列表) -> 局部结果，最后合并"""
+        n = WORKERS if workers is None else workers
+        if len(regions) <= 2 or n <= 1:
+            return fn(regions)
+        import concurrent.futures as cf
+        buckets = self._split(regions, n)
+        with cf.ThreadPoolExecutor(max_workers=len(buckets)) as ex:
+            parts = list(ex.map(fn, buckets))
+        if isinstance(parts[0], dict):
+            merged = {}
+            for part in parts:
+                for k, v in part.items():
+                    merged.setdefault(k, []).extend(v)
+            return merged
+        out = []
+        for part in parts:
+            out.extend(part)
+        return out
+
+    def regions(self, refresh=False):
+        # 每 2 秒重建一次：游戏后加载会不断提交新内存，旧表会漏掉这些区域
+        if (self._regions is not None and not refresh
+                and time.time() - self._regions_t < 2.0):
+            return self._regions
+        out, addr, mbi = [], 0, MBI()
+        while k32.VirtualQueryEx(self.h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            base, size = int(mbi.BaseAddress), int(mbi.RegionSize)
+            if (mbi.State == MEM_COMMIT and mbi.Type == MEM_PRIVATE
+                    and not (mbi.Protect & PAGE_GUARD) and mbi.Protect != PAGE_NOACCESS
+                    and size >= 0x1000):
+                out.append((base, size))
+            nxt = base + size
+            if nxt <= addr:
+                break
+            addr = nxt
+        self._regions = out
+        self._regions_t = time.time()
+        return out
+
+    def find_bytes(self, pattern, limit=512, chunk=8 << 20, regions=None):
+        plen = len(pattern)
+
+        def _scan(rs):
+            hits = []
+            for base, size in rs:
+                off = 0
+                while off < size:
+                    n = min(chunk, size - off)
+                    data = self.read(base + off, n)
+                    if data:
+                        i = data.find(pattern)
+                        while i >= 0:
+                            hits.append(base + off + i)
+                            if len(hits) >= limit:
+                                return hits
+                            i = data.find(pattern, i + 1)
+                        if n < chunk:
+                            break
+                        off += n - (plen - 1)
+                    else:
+                        off += n
+            return hits
+
+        return self._parallel(regions if regions is not None else self.regions(), _scan, 1)
+
+    def _find_bytes_old(self, pattern, limit=512, chunk=8 << 20, regions=None):
+        hits, plen = [], len(pattern)
+        for base, size in (regions if regions is not None else self.regions()):
+            off = 0
+            while off < size:
+                n = min(chunk, size - off)
+                data = self.read(base + off, n)
+                if data:
+                    i = data.find(pattern)
+                    while i >= 0:
+                        hits.append(base + off + i)
+                        if len(hits) >= limit:
+                            return hits
+                        i = data.find(pattern, i + 1)
+                    if n < chunk:
+                        break
+                    off += n - (plen - 1)
+                else:
+                    off += n
+        return hits
+
+
+# ------------------------------------------------------------------ 定位
+    def in_region(self, addr, need=8):
+        """地址是否落在"已提交且可写"的区域里（防止往已释放的块写）"""
+        try:
+            for base, size in self.regions():
+                if base <= addr and addr + need <= base + size:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def find_values(self, values, chunk=8 << 20, regions=None):
+        """一次遍历，找出 values 里每个 u32 在内存中的所有出现位置 -> {value: [addr]}"""
+        import numpy as _np
+        vals = _np.array(sorted(set(values)), dtype='<u4')
+        empty = {int(v): [] for v in vals}
+        if not len(vals):
+            return empty
+
+        def _scan(rs):
+            out = {int(v): [] for v in vals}
+            for base, size in rs:
+                off = 0
+                while off < size:
+                    n = min(chunk, size - off)
+                    data = self.read(base + off, n)
+                    if data and len(data) >= 4:
+                        arr = _np.frombuffer(data[:len(data) // 4 * 4], dtype='<u4')
+                        pos = _np.searchsorted(vals, arr)
+                        _np.clip(pos, 0, len(vals) - 1, out=pos)
+                        hit = vals[pos] == arr
+                        for i in _np.nonzero(hit)[0]:
+                            out[int(arr[i])].append(base + off + int(i) * 4)
+                    off += n
+            return out
+
+        return self._parallel(regions if regions is not None else self.regions(), _scan)
+
+
+SIG = bytes.fromhex('0000000000000040' + '0000000000408F40' * 2)   # 2.0, 1000.0, 1000.0（旧锚点，仅诊断用）
+QI_SIG = bytes.fromhex('0000000000c07240' + '0000000000005940' * 2)  # 300.0, 100.0, 100.0
+QI_TO_BASE = 0xC8      # qiMax 距离对象基址（= qi + 8）
+
+
+class Fighter:
+    __slots__ = ('addr', 'team', 'qi_off', 'hits', 'hitmap', 'hit_time', 'prev_qi', 'applied', 'first_x', 'low_since', 'peak_hits', 'drop_since')
+
+    def __init__(self, addr, qi_off=None):
+        self.addr = addr
+        self.team = None
+        self.qi_off = qi_off
+        self.hits = []
+        self.hitmap = {}
+        self.first_x = None
+        self.low_since = None
+        self.peak_hits = 0
+        self.drop_since = None
+        self.hit_time = 0.0
+        self.prev_qi = None
+        self.applied = {}      # 招式地址 -> 我们写进去的倍率
+
+    # 基址偏移（用 2.0 那段签名作为锚点，已在真实进程里核对过）
+    @property
+    def atkrate_addr(self):
+        return self.addr + 0x20
+
+    @property
+    def defrate_addr(self):
+        return self.addr + 0x28
+
+    @property
+    def defrate_addr2(self):
+        """已按 AS3 源码确认：+0x20 = _attackRate，+0x28 = _defenseRate，
+        所以防御只写 +0x28（BaseGameSprite 字段声明顺序 + loseHp 用的就是 defenseRate）。"""
+        return None
+
+    @property
+    def qi_addr(self):
+        return None if self.qi_off is None else self.addr + self.qi_off
+
+
+def locate_qi(blob):
+    """在对象里定位 qi 字段。
+    首选 [qiMax=300][energy=100][energyMax=100] 三段签名（qi 在 300 前面 8 字节）；
+    退一步找连续两个 100.0，把前 16 字节当 qi。
+    """
+    i = blob.find(QI_SIG)
+    if i >= 0 and i % 8 == 0 and i >= 8:
+        return i - 8
+    duo = struct.pack('<d', 100.0) * 2
+    j = blob.find(duo)
+    while j >= 0:
+        if j % 8 == 0 and j >= 16:
+            v = struct.unpack_from('<d', blob, j - 16)[0]
+            if 0.0 <= v <= 300.0:
+                return j - 16
+        j = blob.find(duo, j + 1)
+    return None
+
+
+QMAX_SIG = struct.pack('<d', 300.0)     # qiMax 常量，战斗中也一直是 300
+
+
+def scan_fighters(mem, deep=False):
+    """以 qiMax=300 为锚点找 FighterMain，再做结构校验。
+
+    deep=False：只扫热点区域（几十毫秒），找不到才回退全堆
+    deep=True ：直接全堆扫描（~0.5 秒），用来兜住"新对象分配到别的区域"
+    """
+    passes = [None] if deep else ([mem.hot, None] if mem.hot else [None])
+    for regions in passes:
+        out, seen = [], set()
+        for x in mem.find_bytes(QMAX_SIG, limit=256, regions=regions):
+            base = x - 0xC8
+            if base < 0x10000 or base in seen:
+                continue
+            heavy = mem.rd_d(base)
+            hp = mem.rd_d(base + 8)
+            mx = mem.rd_d(base + 0x10)
+            dfc = mem.rd_d(base + 0x18)
+            ar = mem.rd_d(base + 0x20)
+            dr = mem.rd_d(base + 0x28)
+            qi = mem.rd_d(base + 0xC0)
+            en = mem.rd_d(base + 0xD0)
+            if None in (heavy, hp, mx, dfc, ar, dr, qi, en):
+                continue
+            if not (1.0 <= heavy <= 10.0):
+                continue
+            if not (1.0 <= mx <= 1e6) or not (0.0 <= hp <= mx):
+                continue
+            if abs(dfc) > 1000.0:
+                continue
+            if not (0.5 <= ar <= 3.0) or not (0.5 <= dr <= 2.2):
+                continue
+            if not (0.0 <= qi <= 300.0) or not (-10.0 <= en <= 5000.0):
+                continue
+            seen.add(base)
+            out.append(Fighter(base, 0xC0))
+        if out:
+            for f in out:
+                mem.note_region(f.addr)
+            return out
+    return []
+
+
+user32 = ctypes.WinDLL('user32', use_last_error=True)
+VK_LEFT, VK_RIGHT, VK_A, VK_D = 0x25, 0x27, 0x41, 0x44
+
+
+def key_down(vk):
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+class Calibrator:
+    """按 WASD 时哪个角色在动 —— 动的那个才是你（你用的是 WASD 这边）。
+
+    对手就算也用键盘（方向键），和 WASD 没有相关性，多点采样就能分开。
+    """
+
+    VK_A, VK_D, VK_W, VK_S = 0x41, 0x44, 0x57, 0x53
+
+    def __init__(self):
+        self.votes = {}
+        self.prev = {}
+        self.result = None
+        self.samples = 0
+
+    def reset(self):
+        self.votes = {}
+        self.prev = {}
+        self.result = None
+        self.samples = 0
+
+    def feed(self, mem, fighters):
+        if self.result is not None or len(fighters) < 2:
+            return None
+        left = key_down(self.VK_A)
+        right = key_down(self.VK_D)
+        self.samples += 1
+        for f in fighters:
+            x = mem.rd_d(f.addr + 0x30)
+            if x is None:
+                continue
+            px = self.prev.get(f.addr)
+            self.prev[f.addr] = x
+            if px is None:
+                continue
+            dx = x - px
+            if left and dx < -0.5:
+                self.votes[f.addr] = self.votes.get(f.addr, 0) + 1
+            elif right and dx > 0.5:
+                self.votes[f.addr] = self.votes.get(f.addr, 0) + 1
+        if self.votes:
+            ranked = sorted(self.votes.items(), key=lambda kv: -kv[1])
+            best, n = ranked[0]
+            second = ranked[1][1] if len(ranked) > 1 else 0
+            if n >= 5 and n - second >= 3:
+                self.result = best
+                return best
+        return None
+
+
+# ---- 节奏参数（回退到 0.1 秒之前的那套）----
+SEARCH_GAP = 0.0      # 空槽搜索间隔（0 = 每个 tick 都找）
+SCAN_GAP = 0.1        # 扫描节流（秒），热点扫描只要 2ms
+LEARN_GAP = 0.5       # 招式表重抓节流（秒）
+SLOW_GAP = 0.3        # 招式倍率写入间隔（秒）
+TICK_IDLE = 0.10      # 两边都锁住时的节拍
+TICK_SEARCH = 0.02    # 有空槽（找人/等对手）时的节拍
+UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
+
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.json')
+WORKERS = max(2, min(8, (os.cpu_count() or 4)))
+MIN_HITS = 8          # 锁定门槛：真角色都在 15 条以上，5~7 条多半是学了一半
+DEAD_DEBOUNCE = 0.3   # 连续这么久都不像活人，才判退场
+
+APP_NAME = "死神vs火影 Yk修改器"
+APP_VER = "1.0.11"
+
+OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
+
+
+def move_name(mem, r):
+    """HitVO 的 id 是 AVM2 String：obj+0x08 是 char*，obj+0x10 是长度"""
+    idp = mem.rd_u(r - 0x04)
+    if not idp:
+        return '?'
+    hdr = mem.read(idp, 20)
+    if not hdr or len(hdr) < 20:
+        return '?'
+    buf = struct.unpack_from('<I', hdr, 8)[0]
+    ln = struct.unpack_from('<I', hdr, 16)[0]
+    if not (0 < ln < 32) or not (0x10000 < buf < 0x7FFFFFFF):
+        return '?'
+    raw = mem.read(buf, ln)
+    if not raw:
+        return '?'
+    try:
+        return raw.decode('utf-8')
+    except Exception:
+        return repr(raw)
+
+
+
+def find_hitvos(mem, base, limit=20000):
+    """找 owner == 该角色的 HitVO。
+
+    实测：AVM2 的 ScriptObject 指针 = base - 0x78；HitVO 里 owner 就在这个指针上。
+        owner+0x0C  power      (double)
+        owner+0x14  powerRate  (double)
+        owner+0x1C  hitx       (double)
+        owner+0x24  hity       (double)
+
+    一个角色可能被上千个地方引用（每帧的临时数组），HitVO 只是其中几十个，
+    所以必须把引用全扫完再过滤，不能只取前几百个。
+    """
+    obj = base - OBJ_OFF
+    hits, seen = [], set()
+    for r in mem.find_bytes(struct.pack('<I', obj), limit=limit):
+        raw = mem.read(r + 0x0C, 0x20)          # 一次读 4 个 double
+        if not raw or len(raw) < 0x20:
+            continue
+        pw, rt, hx, hy = struct.unpack('<4d', raw)
+        if not (0.0 <= pw <= 20000.0):
+            continue
+        if not (0.01 <= rt <= 1000.0):
+            continue
+        if not (-200.0 <= hx <= 200.0 and -200.0 <= hy <= 200.0):
+            continue
+        if r in seen:
+            continue
+        seen.add(r)
+        hits.append((r + 0x14, pw))
+    return hits
+
+
+def avm_string(mem, ptr):
+    """读 AVM2 String 对象（+0x08 是 char*，+0x10 是长度）"""
+    hdr = mem.read(ptr, 20) if ptr else None
+    if not hdr or len(hdr) < 20:
+        return None
+    buf = struct.unpack_from('<I', hdr, 8)[0]
+    ln = struct.unpack_from('<I', hdr, 16)[0]
+    if not (0 < ln < 40) or not (0x10000 < buf < 0x7FFFFFFF):
+        return None
+    raw = mem.read(buf, ln)
+    if not raw:
+        return None
+    try:
+        return raw.decode('utf-8')
+    except Exception:
+        return None
+
+
+def find_team_name(mem, f):
+    """在角色对象里找 team 指针。
+
+    TeamVO 的特征：对象头是类 vtable（第一次读到就记下来），
+    +0x10 是 id（1/2），+0x14 是名字字符串（"P1"/"P2"），两者必须对得上。
+    只认第一个满足条件的指针，避免把别的带 "P1" 字符串的对象当成 team。
+    """
+    first = None
+    for off in range(0, 0x300, 4):
+        p = mem.rd_u(f.addr + off)
+        if not p or not (0x10000 < p < 0x7FFFFFFF):
+            continue
+        raw = mem.read(p, 0x20)
+        if not raw or len(raw) < 0x20:
+            continue
+        vt = struct.unpack_from('<I', raw, 0)[0]
+        tid = struct.unpack_from('<i', raw, 0x10)[0]
+        sp = struct.unpack_from('<I', raw, 0x14)[0]
+        if tid not in (1, 2) or not (0x10000 < sp < 0x7FFFFFFF):
+            continue
+        nm = avm_string(mem, sp)
+        if nm != 'P%d' % tid:
+            continue
+        if getattr(mem, 'team_vt', None) is None:
+            mem.team_vt = vt
+        if vt != mem.team_vt:
+            continue
+        if first is None or off == 0x174:
+            first = tid
+        if off == 0x174:
+            return tid
+    return first
+
+
+def cluster_teams(mem, fighters):
+    """同队角色会共享同一个 TeamVO 指针。按"字段区里有没有相同指针"聚类。
+
+    返回 [[fighter,...], [fighter,...]] 或 None（分不出来就返回 None）
+    """
+    n = len(fighters)
+    if n < 3:
+        return None
+    keys = []
+    for f in fighters:
+        ks = set()
+        for off in range(0, 0x300, 4):
+            p = mem.rd_u(f.addr + off)
+            if p and 0x10000 < p < 0x7FFFFFFF:
+                ks.add((off, p))
+        keys.append(ks)
+
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if keys[i] & keys[j]:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(fighters[i])
+    return list(groups.values())
+
+
+def defense_rate_for(mult):
+    """loseHp(): k = clamp(2 - defenseRate, 0.1, 1) → 想保留 1/mult 的伤害"""
+    mult = max(1.0, float(mult))
+    return max(1.0, min(1.9, 2.0 - 1.0 / mult))
+
+
+# ------------------------------------------------------------------ 引擎
+class Engine:
+    def __init__(self):
+        self.mem = None
+        self.pid = None
+        self.host = ''
+        self.fighters = []
+        self.status = '未连接'
+        self.log = []
+        self.lock = threading.Lock()
+        self.stop = False
+        self.atk = {1: 1.0, 2: 1.0}
+        self.dfn = {1: 1.0, 2: 1.0}
+        self.qi = {1: 1.0, 2: 1.0}
+        self.written_rates = {float(v) for v in range(1, 21)}  # 攻击滑块能产出的整数倍率
+        self.swap = False
+        self._hitmax = {}
+        self.groups = {1: [], 2: []}
+        self.cands = []
+        self.pool = {}
+        self._last_full = 0.0
+        self.slot = {}          # addr -> 1/2，一旦分配就不再变
+        self.locked = {1: None, 2: None}
+        self._last_search = 0.0
+        self._writes = 0
+        self._writes_t0 = 0.0
+        self._last_slow = 0.0
+        self._conn_t = 0.0
+        self._both_drop_since = 0.0
+        self._reset_req = False
+        self._dead_since = {}
         self._last_full_refresh = 0.0
         self._last_deep = 0.0
         self._last_hp = {}
@@ -903,7 +1443,7 @@ class Engine:
             self._learn(f, force=True, refs=refs.get(f.addr - OBJ_OFF, []))
 
         # 学完还是不够（过严的条目被滤掉了 / 热点没覆盖到）→ 回退全堆，每秒最多一次
-        if any(len(f.hits) < 5 for f in fighters) and \
+        if any(len(f.hits) < MIN_HITS for f in fighters) and \
                 time.time() - self._last_full_refresh > 1.0:
             self._last_full_refresh = time.time()
             refs = self.mem.find_values(owners)
@@ -968,7 +1508,8 @@ class Engine:
         x = self.mem.rd_d(f.addr + 0x30)
         if hp is None or x is None:
             return False
-        return hp > 0.0 and x > 0.5
+        # x = -1 是待命/未上场；屏幕最左边时 x 可以接近 0，不能拿 0.5 当死线
+        return hp > 0.0 and x > -0.5
 
     def _release(self, team):
         f = self.locked.get(team)
@@ -994,13 +1535,22 @@ class Engine:
         if not self.mem:
             return
         before = sum(1 for t in (1, 2) if self.locked[t] is not None)
+        _now = time.time()
         for t in (1, 2):
             f = self.locked.get(t)
-            if f is not None and not self._live(f):
+            if f is None:
+                continue
+            if self._live(f):
+                self._dead_since.pop(f.addr, None)
+                continue
+            # 去抖：连续 DEAD_DEBOUNCE 秒都不像活人才算退场
+            since = self._dead_since.setdefault(f.addr, _now)
+            if _now - since >= DEAD_DEBOUNCE:
                 self.say('0x%08x 阵亡/退场（P%d）' % (f.addr, t))
                 self.slot.pop(f.addr, None)
                 self.locked[t] = None
                 self._still_since.pop(f.addr, None)
+                self._dead_since.pop(f.addr, None)
         for a in [a for a, f in self.pool.items() if not self._live(f)]:
             self.pool.pop(a, None)
         now = time.time()
@@ -1062,11 +1612,11 @@ class Engine:
         if not cands:
             return
         _now = time.time()
-        need = [f for f in cands if len(f.hits) < 8
+        need = [f for f in cands if len(f.hits) < MIN_HITS
                 and _now - self._learnt.get(f.addr, 0) > 0.2][:3]
         if need:
             self._refresh_hits(need)          # 一次遍历，一次拿全部候选的招式数
-        cands = [f for f in cands if len(f.hits) >= 5]
+        cands = [f for f in cands if len(f.hits) >= MIN_HITS]
         if not cands:
             return
         empt = [t for t in (1, 2) if self.locked[t] is None]
@@ -1279,7 +1829,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.10')
+        self.title('死神vs火影 Yk修改器 1.0.11')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
