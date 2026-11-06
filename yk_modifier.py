@@ -589,7 +589,7 @@ MIN_HITS = 8          # 锁定门槛：真角色都在 15 条以上，5~7 条多
 DEAD_DEBOUNCE = 0.3   # 连续这么久都不像活人，才判退场
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.12"
+APP_VER = "1.0.13"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -1126,7 +1126,7 @@ MIN_HITS = 8          # 锁定门槛：真角色都在 15 条以上，5~7 条多
 DEAD_DEBOUNCE = 0.3   # 连续这么久都不像活人，才判退场
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.12"
+APP_VER = "1.0.13"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -1789,7 +1789,12 @@ class Engine:
                     continue
                 # 只覆盖"看着像倍率"的值，或者我们自己写进去的值
                 mine = f.applied.get(pa)
-                if not (0.1 <= cur <= 3.0 or (mine is not None and abs(cur - mine) < 1e-6)):
+                # 0.1~3.0 是正常倍率；1~20 的整数是"我们上一轮写进去、这轮还没记录"的值；
+                # 两者都允许覆盖，否则重开工具后就再也改不回去了
+                plausible = (0.1 <= cur <= 3.0
+                             or (abs(cur - round(cur)) < 1e-6 and 1.0 <= cur <= 20.0)
+                             or (mine is not None and abs(cur - mine) < 1e-6))
+                if not plausible:
                     continue
                 if self._safe_write(pa, m):
                     f.applied[pa] = m
@@ -1838,7 +1843,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.12')
+        self.title('死神vs火影 Yk修改器 1.0.13')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
