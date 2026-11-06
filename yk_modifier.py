@@ -433,7 +433,9 @@ QI_TO_BASE = 0xC8      # qiMax 距离对象基址（= qi + 8）
 
 
 class Fighter:
-    __slots__ = ('addr', 'team', 'qi_off', 'hits', 'hitmap', 'hit_time', 'prev_qi', 'applied', 'first_x', 'low_since', 'peak_hits', 'drop_since')
+    __slots__ = ('addr', 'team', 'qi_off', 'hits', 'hitmap', 'hit_time', 'prev_qi', 'applied',
+                 'first_x', 'low_since', 'peak_hits', 'drop_since',
+                 'snap', 'alive_since')
 
     def __init__(self, addr, qi_off=None):
         self.addr = addr
@@ -448,6 +450,8 @@ class Fighter:
         self.hit_time = 0.0
         self.prev_qi = None
         self.applied = {}      # 招式地址 -> 我们写进去的倍率
+        self.snap = None       # 上一次活性采样 (hp, x, qi)
+        self.alive_since = None  # 首次观测到帧间变化的时刻；None=尚未证明参战（可能是上局残留）
 
     # 基址偏移（用 2.0 那段签名作为锚点，已在真实进程里核对过）
     @property
@@ -661,7 +665,7 @@ ACTIVE_MOVE_OFF = 0x78
 FAST_MOVE_HI = 30     # 快速判据硬上界：真角色动态值严格小于模板最小值
 TEMPLATE_FREQ = 4     # 频次法：同一 0x78 值出现这么多次即认定为模板值，版本漂移也能自适应
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
-APP_VER = "1.2.3"
+APP_VER = "1.2.4"
 
 
 # ------------------------------------------------------------------ 引擎
@@ -964,6 +968,8 @@ class Engine:
                 f.applied = old.applied
                 f.peak_hits = old.peak_hits
                 f.drop_since = old.drop_since
+                f.snap = old.snap                 # 继承活性基线，避免同地址角色每轮重新确认
+                f.alive_since = old.alive_since
             pool[f.addr] = f
         if self.mem is mem:                     # 期间没被重置才发布
             self.pool = pool                    # 原子整体替换
@@ -1083,10 +1089,39 @@ class Engine:
         """读 FighterMain+0x78 的当前激活招式数；读不到返回 None。"""
         return self.mem.rd_i(f.addr + ACTIVE_MOVE_OFF)
 
+    def _vitals(self, f):
+        """活性采样：血量 / x 坐标 / 气 / 能量 / 激活招式数。
+        真对局角色由游戏循环每帧驱动，五者至少其一在变；上一局残留对象则全部冻结。
+        多放几个字段是为了在开局倒计时等短暂静止期也能尽快捕捉到第一个变化。"""
+        return (self.mem.rd_d(f.addr + 8),
+                self.mem.rd_d(f.addr + 0x30),
+                self.mem.rd_d(f.addr + 0xC0),
+                self.mem.rd_d(f.addr + 0xD0),
+                self.mem.rd_i(f.addr + ACTIVE_MOVE_OFF))
+
+    def _observe_activity(self, cands):
+        """逐候选采样并比对上一帧：任一战斗属性变化即标记参战时刻。
+        新对象先记基线、本帧不判活，避免把"第一次读到"误当成"发生变化"。"""
+        now = time.time()
+        for f in cands:
+            cur = self._vitals(f)
+            if None in cur:
+                continue
+            if f.snap is not None and cur != f.snap and f.alive_since is None:
+                f.alive_since = now
+            f.snap = cur
+
+    def _is_field_active(self, f):
+        """双条件：0x78 在真人招式区间（排除 0/模板 30/61）且已观测到帧间变化（排除上局残留）。"""
+        v = self._active_moves(f)
+        if v is None or not (1 <= v < FAST_MOVE_HI):
+            return False
+        return f.alive_since is not None
+
     def _fast_pick(self, cands):
-        """用 +0x78 字段直接认出当前对局真角色，不依赖全堆 HitVO 扫描。
-        双保险：① 硬区间 1..FAST_MOVE_HI-1（真角色动态值，模板固定值≥30）；
-        ② 频次法——同一值在候选里出现≥TEMPLATE_FREQ 次即判模板值并剔除，版本漂移也能自适应。"""
+        """认出"当前这一局正在打"的真角色。
+        0x78 只负责排除模板池（固定值 0/30/61）；真正区分上一局残留与当前角色的是动态活性——
+        残留对象在非对局时 hp/x/qi 完全冻结，当前角色每帧都在变。频次法继续剔除版本模板值。"""
         vals = {}
         for f in cands:
             v = self._active_moves(f)
@@ -1096,7 +1131,7 @@ class Engine:
         out = []
         for v, fs in vals.items():
             if 1 <= v < FAST_MOVE_HI and v not in template_vals:
-                out.extend(fs)
+                out.extend(f for f in fs if f.alive_since is not None)
         return out
 
     def _assign(self, picked):
@@ -1147,7 +1182,9 @@ class Engine:
         now = time.time()
         empt = [t for t in (1, 2) if self.locked[t] is None]
 
-        # —— 快速路径：0x78 字段直接判定，一次 4 字节读，无需等 HitVO 学满 ——
+        # —— 快速路径：0x78 排除模板 + 帧间活性排除上局残留，双条件都满足才锁 ——
+        # 先采样本帧活性（新对象这一帧只建基线，下一帧起才能确认变化），再挑选
+        self._observe_activity(cands)
         fast = self._fast_pick(cands)
         if fast:
             self._assign(fast)
@@ -1349,7 +1386,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.2.3')
+        self.title('死神vs火影 Yk修改器 1.2.4')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
