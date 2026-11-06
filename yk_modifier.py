@@ -176,6 +176,22 @@ def find_flash_pid():
     return cands[0][0], cands[0][1], cands[0][2]
 
 
+_POOL = None
+
+
+def _get_pool(need):
+    """模块级复用的扫描线程池；need 变大时扩一次容（只增不减，封顶 WORKERS）。"""
+    global _POOL
+    import concurrent.futures as cf
+    size = max(2, min(WORKERS, need))
+    if _POOL is None or getattr(_POOL, '_max_workers', 0) < size:
+        if _POOL is not None:
+            _POOL.shutdown(wait=False)
+        _POOL = cf.ThreadPoolExecutor(max_workers=size)
+        _POOL._max_workers = size
+    return _POOL
+
+
 class Mem:
     def __init__(self, pid):
         self.pid = pid
@@ -284,14 +300,16 @@ class Mem:
         return [b for b in buckets if b]
 
     def _parallel(self, regions, fn, workers=None):
-        """把区域分组并行扫描，fn(区域列表) -> 局部结果，最后合并"""
+        """把区域分组并行扫描，fn(区域列表) -> 局部结果，最后合并。
+        线程池模块级复用，避免每次扫描都创建/销毁一批线程（实测每次省 5~15ms）。"""
+        if not regions:
+            return fn(regions)              # 空输入交给 fn，保持返回类型一致
         n = WORKERS if workers is None else workers
         if len(regions) <= 2 or n <= 1:
             return fn(regions)
-        import concurrent.futures as cf
         buckets = self._split(regions, n)
-        with cf.ThreadPoolExecutor(max_workers=len(buckets)) as ex:
-            parts = list(ex.map(fn, buckets))
+        ex = _get_pool(len(buckets))
+        parts = list(ex.map(fn, buckets))
         if isinstance(parts[0], dict):
             merged = {}
             for part in parts:
@@ -591,6 +609,7 @@ def defense_rate_for(mult):
 # ---------------------------------------------------------------- 引擎常量
 SEARCH_GAP = 0.0      # 空槽搜索间隔（0 = 每个 tick 都找）
 LEARN_GAP = 0.5       # 招式表重抓节流（秒）
+LEARN_RETRY = 0.25    # 候选没学满时的重试节流（秒，越小锁定越快）
 SLOW_GAP = 0.3        # 招式倍率写入间隔（秒）
 TICK_IDLE = 0.10      # 两边都锁住时的节拍
 TICK_SEARCH = 0.02    # 有空槽（找人/等对手）时的节拍
@@ -601,7 +620,7 @@ MIN_HITS = 8          # 锁定门槛：真角色都在 15 条以上，5~7 条多
 DEAD_DEBOUNCE = 0.3   # 连续这么久都不像活人，才判退场
 OBJ_OFF = 0x78        # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
-APP_VER = "1.2.0"
+APP_VER = "1.2.1"
 
 
 # ------------------------------------------------------------------ 引擎
@@ -637,8 +656,10 @@ class Engine:
         self.locked = {1: None, 2: None}
         # 后台任务请求（引擎置位，worker 消费）
         self._scan_req = False
-        self._learn_req = None
+        self._learn_req = None       # 搜索候选的学习（要尽快，影响锁定速度）
+        self._refresh_req = None     # 已锁定角色的周期刷新（1.5s 一次，可让位）
         self._scan_t = 0.0
+        self._wake = threading.Event()
         self._learnt = {}              # addr -> 最近一次学招式表的时间
         # 计时器 / 去抖
         self._last_deep = 0.0
@@ -676,9 +697,12 @@ class Engine:
         self.pool = {}
         self._scan_req = True
         self._learn_req = None
+        self._refresh_req = None
         self._scan_t = 0.0
+        self._wake.set()
         self._learnt = {}
-        self._last_deep = 0.0
+        # 重置后立刻起算深扫周期：否则 _last_deep=0 会让第一扫满足">12s"而走 700ms 深扫
+        self._last_deep = time.time()
         self._last_full_refresh = 0.0
         self._last_search = 0.0
         self._last_slow = 0.0
@@ -757,7 +781,7 @@ class Engine:
         return len(f.hits)
 
     def _refresh_hits(self, fighters):
-        """一次遍历拿全部引用，再分发给每个角色；热点不够再回退全堆（每秒最多一次）。"""
+        """一次遍历拿全部引用，再分发给每个角色；热点学不满就快速回退全堆。"""
         mem = self.mem
         if not fighters or not mem:
             return
@@ -766,8 +790,9 @@ class Engine:
         refs = mem.find_values(owners, regions=zones)
         for f in fighters:
             self._learn(f, force=True, refs=refs.get(f.addr - OBJ_OFF, []))
+        # 热点不够：全堆补一次。节流从 1s 缩到 0.4s，避免新对局 HitVO 落在新区域时干等
         if any(len(f.hits) < MIN_HITS for f in fighters) and \
-                time.time() - self._last_full_refresh > 1.0:
+                time.time() - self._last_full_refresh > 0.4:
             self._last_full_refresh = time.time()
             refs = mem.find_values(owners)
             for addrs in refs.values():
@@ -776,7 +801,7 @@ class Engine:
                         if base <= a < base + size:
                             if (base, size) not in mem.ref_hot:
                                 mem.ref_hot.append((base, size))
-                                if len(mem.ref_hot) > 12:
+                                if len(mem.ref_hot) > 24:
                                     mem.ref_hot.pop(0)
                                 mem._save_cache()
                             break
@@ -784,8 +809,13 @@ class Engine:
                 self._learn(f, force=True, refs=refs.get(f.addr - OBJ_OFF, []))
 
     # ---------------- 后台线程 ----------------
+    def _kick(self):
+        """唤醒 worker（Event.set 是原子的，重复调用无害）。"""
+        self._wake.set()
+
     def _worker_loop(self):
         while not self.stop:
+            # 优先级：扫描 > 候选学习（决定锁定速度） > 锁定刷新
             job = None
             if self._scan_req:
                 self._scan_req = False
@@ -793,13 +823,16 @@ class Engine:
             elif self._learn_req is not None:
                 job = ('learn', self._learn_req, self._gen)
                 self._learn_req = None
+            elif self._refresh_req is not None:
+                job = ('learn', self._refresh_req, self._gen)
+                self._refresh_req = None
             if job is None:
-                time.sleep(0.01)
+                self._wake.wait(0.05)           # 有任务立刻被唤醒，没任务最多等 50ms
+                self._wake.clear()
                 continue
             try:
                 if job[2] != self._gen or self.mem is None:
                     continue                    # 重置后的旧任务，直接丢
-                mem = self.mem                  # 本地引用，防止执行中被重置置空
                 if job[0] == 'scan':
                     self._do_scan()
                 else:
@@ -814,7 +847,10 @@ class Engine:
         if not mem:
             return
         t_start = time.time()
-        deep = (time.time() - self._last_deep > 15.0) or not self.pool
+        # 默认走热点（实测 36ms 能找全，和 700ms 深扫结果一致）；
+        # scan_fighters(deep=False) 内部在热点为空时会自动回退全堆，
+        # 深扫只作 12s 周期兜底，覆盖"热点有假对象导致不回退"的漏网情况
+        deep = time.time() - self._last_deep > 12.0
         if deep:
             self._last_deep = time.time()
         found = scan_fighters(mem, deep=deep)
@@ -958,9 +994,10 @@ class Engine:
         now = time.time()
         # 学不满的候选全部交给后台，不再限制数量、绝不同步扫描
         need = [f for f in cands if len(f.hits) < MIN_HITS
-                and now - self._learnt.get(f.addr, 0) > LEARN_GAP]
+                and now - self._learnt.get(f.addr, 0) > LEARN_RETRY]
         if need and self._learn_req is None:
             self._learn_req = need
+            self._kick()
             return                               # 等下一轮学完再锁
         cands = [f for f in cands if len(f.hits) >= MIN_HITS]
         if not cands:
@@ -1002,15 +1039,17 @@ class Engine:
         if not self.mem:
             return
         now = time.time()
-        # 1) 扫描请求：池空立刻扫，否则 0.5s 一轮（实际扫描在后台）
-        if self._scan_req is False and now - self._scan_t > (0.1 if not self.pool else 0.5):
+        # 1) 扫描请求：池空 50ms 就再扫（尽快补位），有池 0.5s 一轮（实际扫描在后台）
+        if self._scan_req is False and now - self._scan_t > (0.05 if not self.pool else 0.5):
             self._scan_req = True
-        # 2) 锁定角色的招式表定期刷新（1.5s），保证骤减/退局判定拿得到新数据
+            self._kick()
+        # 2) 锁定角色的招式表定期刷新（1.5s），走独立通道，不抢候选学习的槽
         refresh = [f for f in self.fighters_now()
                    if now - self._learnt.get(f.addr, 0) > 1.5]
-        if refresh and self._learn_req is None and now - self._last_refresh_req > 1.0:
-            self._learn_req = refresh
+        if refresh and self._refresh_req is None and now - self._last_refresh_req > 1.0:
+            self._refresh_req = refresh
             self._last_refresh_req = now
+            self._kick()
         # 3) 死活与退局
         self._drop_dead()
         # 4) 两格都空 → 清槽位；有空槽 → 搜索
@@ -1172,7 +1211,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.2.0')
+        self.title('死神vs火影 Yk修改器 1.2.1')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
