@@ -586,7 +586,7 @@ CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.
 WORKERS = max(2, min(8, (os.cpu_count() or 4)))
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.7"
+APP_VER = "1.0.8"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -920,7 +920,8 @@ class Engine:
     # ---- 候选池 ----    # ---- 候选池 ----
     def _full_scan(self):
         """只找人，不抓招式表（快，0.2~0.5 秒）"""
-        if not self.mem:
+        mem = self.mem                      # 拿个本地引用，避免中途被置空
+        if not mem:
             return
         if time.time() - self._last_full < SCAN_GAP:
             return
@@ -929,15 +930,22 @@ class Engine:
         deep = time.time() - self._last_deep > 15.0
         if deep:
             self._last_deep = time.time()
-        found = scan_fighters(self.mem, deep=deep)
+        found = scan_fighters(mem, deep=deep)
         if not found:
+            # 一个都没有时顺手确认进程还在不在：读一块已提交区域，失败就是进程没了
+            regs = mem.regions()
+            if regs and mem.read(regs[0][0], 16) is None:
+                self.say('目标进程已退出，重新连接')
+                self.mem = None
+                self._conn_t = 0.0
+                return
             # 一个都没有：可能是区域表过旧（游戏刚加载），重建后深扫一次
-            self.mem._regions = None
-            found = scan_fighters(self.mem, deep=True)
+            mem._regions = None
+            found = scan_fighters(mem, deep=True)
         for f in found:
             if not self.alive(f):
                 continue
-            if (self.mem.rd_d(f.addr + 8) or 0.0) <= 0.0:
+            if (mem.rd_d(f.addr + 8) or 0.0) <= 0.0:
                 continue
             old = self.pool.get(f.addr)
             if old is not None:
@@ -1013,6 +1021,8 @@ class Engine:
 
     def _search_step(self):
         """搜索态：找"活人里招式表最全的"，两格都空时按 x 分 P1/P2"""
+        if not self.mem:
+            return
         self._full_scan()
         used = {f.addr for f in self.locked.values() if f is not None}
         cands = [f for a, f in self.pool.items()
@@ -1231,7 +1241,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.7')
+        self.title('死神vs火影 Yk修改器 1.0.8')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
