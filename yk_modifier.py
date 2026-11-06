@@ -610,6 +610,8 @@ def defense_rate_for(mult):
 SEARCH_GAP = 0.0      # 空槽搜索间隔（0 = 每个 tick 都找）
 LEARN_GAP = 0.5       # 招式表重抓节流（秒）
 LEARN_RETRY = 0.25    # 候选没学满时的重试节流（秒，越小锁定越快）
+LEARN_RETRY_EMPTY = 0.12  # 还有空槽时的重试节流：候补/新局优先尽快学满
+FULL_FALLBACK = 0.3   # 热点学不满时回退全堆的节流（秒）
 SLOW_GAP = 0.3        # 招式倍率写入间隔（秒）
 TICK_IDLE = 0.10      # 两边都锁住时的节拍
 TICK_SEARCH = 0.02    # 有空槽（找人/等对手）时的节拍
@@ -618,9 +620,10 @@ CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.
 WORKERS = max(2, min(8, (os.cpu_count() or 4)))
 MIN_HITS = 8          # 锁定门槛：真角色都在 15 条以上，5~7 条多半是学了一半
 DEAD_DEBOUNCE = 0.3   # 连续这么久都不像活人，才判退场
+DEATH_GRACE = 3.0     # 有人阵亡后的换局宽限：此期间不执行"单人骤减→退局"，给候补上场时间
 OBJ_OFF = 0x78        # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
-APP_VER = "1.2.1"
+APP_VER = "1.2.2"
 
 
 # ------------------------------------------------------------------ 引擎
@@ -672,6 +675,7 @@ class Engine:
         self._writes_t0 = 0.0
         self._dead_since = {}
         self._both_drop_since = 0.0
+        self._grace_until = 0.0
         self._last_hp = {}
         self._reset_req = False
         # 代次与线程
@@ -712,6 +716,7 @@ class Engine:
         self._writes_t0 = 0.0
         self._dead_since = {}
         self._both_drop_since = 0.0
+        self._grace_until = 0.0
         self._last_hp = {}
         self._reset_req = False
         self.written_rates = {float(v) for v in range(1, 21)}
@@ -790,9 +795,9 @@ class Engine:
         refs = mem.find_values(owners, regions=zones)
         for f in fighters:
             self._learn(f, force=True, refs=refs.get(f.addr - OBJ_OFF, []))
-        # 热点不够：全堆补一次。节流从 1s 缩到 0.4s，避免新对局 HitVO 落在新区域时干等
+        # 热点不够：全堆补一次。空槽/换局时节流压到 FULL_FALLBACK，避免新 HitVO 落在新区域时干等
         if any(len(f.hits) < MIN_HITS for f in fighters) and \
-                time.time() - self._last_full_refresh > 0.4:
+                time.time() - self._last_full_refresh > FULL_FALLBACK:
             self._last_full_refresh = time.time()
             refs = mem.find_values(owners)
             for addrs in refs.values():
@@ -848,9 +853,11 @@ class Engine:
             return
         t_start = time.time()
         # 默认走热点（实测 36ms 能找全，和 700ms 深扫结果一致）；
-        # scan_fighters(deep=False) 内部在热点为空时会自动回退全堆，
-        # 深扫只作 12s 周期兜底，覆盖"热点有假对象导致不回退"的漏网情况
-        deep = time.time() - self._last_deep > 12.0
+        # scan_fighters(deep=False) 内部在热点为空时会自动回退全堆。
+        # 深扫只在"两人都锁满"时按 12s 周期兜底；有空槽时绝不深扫，
+        # 否则 700ms 会占住唯一 worker，把更紧急的招式学习任务挡在后面
+        slot_empty = self.locked[1] is None or self.locked[2] is None
+        deep = (not slot_empty) and time.time() - self._last_deep > 12.0
         if deep:
             self._last_deep = time.time()
         found = scan_fighters(mem, deep=deep)
@@ -871,7 +878,9 @@ class Engine:
             if (mem.rd_d(f.addr + 8) or 0.0) <= 0.0:
                 continue
             old = self.pool.get(f.addr)         # 同地址对象沿用已学到的招式表
-            if old is not None:
+            # 只有旧对象仍然活着（同一角色）才继承；地址被回收给新角色时必须从零学，
+            # 否则候补会带着旧峰值/旧招式表，既污染骤减判定也会顶掉真正的新对象
+            if old is not None and self._live(old):
                 f.hits, f.hitmap = old.hits, old.hitmap
                 f.applied = old.applied
                 f.peak_hits = old.peak_hits
@@ -880,9 +889,6 @@ class Engine:
         if self.mem is mem:                     # 期间没被重置才发布
             self.pool = pool                    # 原子整体替换
             self._scan_t = time.time()
-            if self._scan_t - t_start > 2.0:
-                self.say('扫描耗时 %.1fs（%d 个区域，%d 个候选）'
-                         % (self._scan_t - t_start, len(mem.regions()), len(pool)))
 
     @staticmethod
     def _is_valid(mem, f):
@@ -929,15 +935,22 @@ class Engine:
                 continue
             since = self._dead_since.setdefault(f.addr, _now)
             if _now - since >= DEAD_DEBOUNCE:    # 连续 0.3s 不像活人 → 退场
-                self.say('0x%08x 阵亡/退场（P%d）' % (f.addr, t))
-                self.slot.pop(f.addr, None)
-                self.locked[t] = None
-                self._dead_since.pop(f.addr, None)
-        for a in [a for a, f in self.pool.items() if not self._live(f)]:
+                self.say('0x%08x 阵亡/退场（P%d），等待候补上场' % (f.addr, t))
+                # 完整释放：踢出候选池、清旧招式表/峰值、立即请求重扫。
+                # 旧代码只清 locked，死对象残留在池里会带着旧峰值顶掉候补，是补位失效的根因
+                self._release(t)
+                # 场上还有人 → 进入换局宽限，期间不判"单人骤减→退局"，给候补留出上场时间
+                if self.locked[1] is not None or self.locked[2] is not None:
+                    self._grace_until = time.time() + DEATH_GRACE
+        # 清理池里其它已失效候选（未锁定的）
+        for a in [a for a, f in list(self.pool.items()) if not self._live(f)]:
             self.pool.pop(a, None)
 
         now = time.time()
         occupied = sum(1 for t in (1, 2) if self.locked[t] is not None)
+        if occupied == 2:
+            self._grace_until = 0.0              # 双方都回来了，宽限提前结束
+        in_grace = now < self._grace_until
         for t in (1, 2):
             f = self.locked[t]
             if f is None:
@@ -946,11 +959,15 @@ class Engine:
             if n > f.peak_hits:
                 f.peak_hits = n
             hp = self.mem.rd_d(f.addr + 8) or 0.0
-            # 只剩一个人时：招式数从峰值骤减 → 本局结束
-            if occupied == 1 and hp > 0.0 and f.peak_hits >= 10 and n <= max(3, f.peak_hits // 3):
+            # 只剩一个人时：招式数从峰值骤减 → 本局结束。
+            # 换局宽限期内只累积计时、不执行释放，给候补留上场时间；宽限一过立即判定，
+            # 这样无论候补来不来，终局都不会被无限推迟
+            drop = (occupied == 1 and hp > 0.0
+                    and f.peak_hits >= 10 and n <= max(3, f.peak_hits // 3))
+            if drop:
                 if f.drop_since is None:
                     f.drop_since = now
-                elif now - f.drop_since > 2.0:
+                elif not in_grace and now - f.drop_since > 2.0:
                     self.say('0x%08x 血量 %.0f 但招式数从 %d 骤减到 %d → 判定本局结束'
                              % (f.addr, hp, f.peak_hits, n))
                     self._release(1)
@@ -993,8 +1010,9 @@ class Engine:
             return
         now = time.time()
         # 学不满的候选全部交给后台，不再限制数量、绝不同步扫描
+        gap = LEARN_RETRY_EMPTY if (self.locked[1] is None or self.locked[2] is None) else LEARN_RETRY
         need = [f for f in cands if len(f.hits) < MIN_HITS
-                and now - self._learnt.get(f.addr, 0) > LEARN_RETRY]
+                and now - self._learnt.get(f.addr, 0) > gap]
         if need and self._learn_req is None:
             self._learn_req = need
             self._kick()
@@ -1032,6 +1050,7 @@ class Engine:
             if f is not None:
                 f.prev_qi = self.mem.rd_d(f.qi_addr)
                 f.peak_hits = max(f.peak_hits, len(f.hits))   # 锁定即记峰值
+                f.drop_since = None                           # 清掉旧的骤减计时
                 self._last_hp[f.addr] = self.mem.rd_d(f.addr + 8)
 
     # ---------------- 引擎快节拍（15~100ms） ----------------
@@ -1039,8 +1058,10 @@ class Engine:
         if not self.mem:
             return
         now = time.time()
-        # 1) 扫描请求：池空 50ms 就再扫（尽快补位），有池 0.5s 一轮（实际扫描在后台）
-        if self._scan_req is False and now - self._scan_t > (0.05 if not self.pool else 0.5):
+        # 1) 扫描请求：只要有空槽（阵亡候补 / 新局未锁满）就 50ms 快扫；
+        #    两人都锁满才降到 0.5s 一轮。旧代码只看池是否为空，池里有旧对象时会拖到 0.5s
+        slot_empty = self.locked[1] is None or self.locked[2] is None
+        if self._scan_req is False and now - self._scan_t > (0.05 if slot_empty else 0.5):
             self._scan_req = True
             self._kick()
         # 2) 锁定角色的招式表定期刷新（1.5s），走独立通道，不抢候选学习的槽
@@ -1166,7 +1187,6 @@ class Engine:
             threading.Thread(target=self._worker_loop, name='yk-worker', daemon=True).start()
         try:
             while not self.stop:
-                t0 = time.time()
                 try:
                     if self._reset_req:
                         self._do_restart()
@@ -1174,16 +1194,10 @@ class Engine:
                         if time.time() - self._writes_t0 > 1.0:
                             self._writes_t0 = time.time()
                             self._writes = 0
-                        t1 = time.time()
                         self.tick_fast()
-                        t2 = time.time()
                         if self.fighters and time.time() - self._last_slow > SLOW_GAP:
                             self._last_slow = time.time()
                             self.tick_slow()
-                        t3 = time.time()
-                        if t3 - t0 > 1.0:
-                            self.say('慢周期 %.2fs（连接 %.2f / tick %.2f / slow %.2f）'
-                                     % (t3 - t0, t1 - t0, t2 - t1, t3 - t2))
                     self._beat += 1
                 except Exception as e:
                     self.say('错误: %r' % (e,))
@@ -1211,7 +1225,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.2.1')
+        self.title('死神vs火影 Yk修改器 1.2.2')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
