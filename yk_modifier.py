@@ -657,7 +657,7 @@ DEAD_DEBOUNCE = 0.06  # 连续这么久读到 hp<=0 才判阵亡（仅滤瞬时�
 DROP_HOLD = 3.0       # 招式骤减判定退局需持续的秒数（单锁 / 双锁通用）
 OBJ_OFF = 0x78        # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
-APP_VER = "1.3.0"
+APP_VER = "1.1.0"
 
 
 # ------------------------------------------------------------------ 引擎
@@ -1319,7 +1319,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.3.0')
+        self.title('死神vs火影 Yk修改器 1.1.0')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
