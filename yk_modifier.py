@@ -657,7 +657,7 @@ DEAD_DEBOUNCE = 0.06  # 连续这么久读到 hp<=0 才判阵亡（仅滤瞬时�
 DROP_HOLD = 3.0       # 招式骤减判定退局需持续的秒数（单锁 / 双锁通用）
 OBJ_OFF = 0x78        # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
-APP_VER = "1.1.0"
+APP_VER = "1.1.1"
 
 
 # ------------------------------------------------------------------ 引擎
@@ -945,12 +945,16 @@ class Engine:
         else:
             found = scan_fighters(mem, deep=False)
 
-        # 2) 结构有效且 hp>0 的候选。空槽时若一个有效候选都没有（shallow 只扫到错误热点里的
-        #    模板、真角色在未知区域），按节流做一次全堆"发现"。不能只看 found 是否为空——
-        #    模板也会让 found 非空，却永远锁不上，旧逻辑因此在冷缓存下卡死。
+        # 2) 结构有效且 hp>0 的候选。空槽时若热点区域里没有任何"招式已达标"的角色
+        #    （含两种冷场景：① 一个有效候选都没有；② 只有旧区域残留，结构有效、hp>0 但招式
+        #    永远只有 0~2 条，而真角色已分配到全新内存区域、热点根本扫不到），按节流做一次
+        #    全堆"发现"。只看 valid 是否为空会被残留对象卡死，必须看是否有人真正能锁。
         valid = [f for f in found
                  if self._is_valid(mem, f) and (mem.rd_d(f.addr + 8) or 0.0) > 0.0]
-        if slot_empty and not valid:
+        no_qualified = all(
+            len(self.learn_cache.get(f.addr, {}).get('hitmap', ())) < MIN_HITS
+            for f in valid)
+        if slot_empty and (not valid or no_qualified):
             regs = mem.regions()
             if regs and mem.read(regs[0][0], 16) is None:
                 self.say('目标进程已退出，重新连接')
@@ -1319,7 +1323,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.1.0')
+        self.title('死神vs火影 Yk修改器 1.1.1')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
