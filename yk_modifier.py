@@ -462,14 +462,14 @@ class Calibrator:
 
 
 # ---- 节奏参数（回退到 0.1 秒之前的那套）----
-SEARCH_GAP = 0.8      # 空槽搜索间隔（秒）
-SCAN_GAP = 0.5        # 全堆扫描节流（秒）
+SEARCH_GAP = 0.0      # 空槽搜索间隔（0 = 每个 tick 都找）
+SCAN_GAP = 0.1        # 扫描节流（秒），热点扫描只要 2ms
 LEARN_GAP = 0.5       # 招式表重抓节流（秒）
 SLOW_EVERY = 3        # 每 N 个 tick 写一次招式倍率（0.1s * 3 = 0.3s）
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.3"
+APP_VER = "1.0.4"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -838,6 +838,11 @@ class Engine:
             f.peak_hits = 0
             self._learnt.pop(f.addr, None)
         self.locked[team] = None
+        # 立刻进入下一轮搜索：把所有节流计时器清零（下一 tick 就扫、就锁）
+        self._last_search = 0.0
+        self._last_full = 0.0
+        self._last_full_refresh = 0.0
+        self._last_deep = 0.0
 
     def fighters_now(self):
         return [f for f in (self.locked[1], self.locked[2]) if f is not None]
@@ -953,6 +958,9 @@ class Engine:
             if time.time() - self._last_search > SEARCH_GAP:
                 self._last_search = time.time()
                 self._search_step()
+                # 没锁满就允许下一 tick 立刻再试（不留缓冲）
+                if self.locked[1] is None or self.locked[2] is None:
+                    self._last_search = 0.0
 
         self.fighters = [f for f in (self.locked[1], self.locked[2]) if f is not None]
         self.groups = {1: [self.locked[1]] if self.locked[1] else [],
@@ -1093,7 +1101,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.3')
+        self.title('死神vs火影 Yk修改器 1.0.4')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
