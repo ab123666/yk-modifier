@@ -586,7 +586,7 @@ CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.
 WORKERS = max(2, min(8, (os.cpu_count() or 4)))
 
 APP_NAME = "死神vs火影 Yk修改器"
-APP_VER = "1.0.9"
+APP_VER = "1.0.10"
 
 OBJ_OFF = 0x78          # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 
@@ -773,6 +773,7 @@ class Engine:
         self._last_slow = 0.0
         self._conn_t = 0.0
         self._both_drop_since = 0.0
+        self._reset_req = False
         self._last_full_refresh = 0.0
         self._last_deep = 0.0
         self._last_hp = {}
@@ -781,7 +782,12 @@ class Engine:
         self._learnt = {}
 
     def restart(self):
-        """完整重置：断开进程、清空所有锁定与缓存，等同重启修改器（滑块数值保留）"""
+        """UI 线程调用：只置标志，真正的重置交给引擎线程做（避免和扫描竞争）"""
+        self._reset_req = True
+        self.say('重置中…')
+
+    def _do_restart(self):
+        """由引擎线程执行：断开进程、清空所有锁定与缓存（滑块数值保留）"""
         self.mem = None
         self.pid = None
         self.host = ''
@@ -887,7 +893,7 @@ class Engine:
 
     def _refresh_hits(self, fighters):
         """一次遍历拿全部引用，再分发给每个角色。热点不够再回退全堆。"""
-        if not fighters:
+        if not fighters or not self.mem:
             return
         owners = [f.addr - OBJ_OFF for f in fighters]
 
@@ -985,6 +991,8 @@ class Engine:
 
     def _drop_dead(self):
         """锁定的角色死了 → 该格清空（另一格保持不动）"""
+        if not self.mem:
+            return
         before = sum(1 for t in (1, 2) if self.locked[t] is not None)
         for t in (1, 2):
             f = self.locked.get(t)
@@ -1170,6 +1178,8 @@ class Engine:
             return False
 
     def _write_fast(self, pair):
+        if not self.mem:
+            return
         for f in pair:
             team = 1 if f is self.locked[1] else 2
             if not self._looks_like_fighter(f):
@@ -1240,6 +1250,9 @@ class Engine:
         n = 0
         while not self.stop:
             try:
+                if self._reset_req:
+                    self._reset_req = False
+                    self._do_restart()
                 if self.connect():
                     if time.time() - self._writes_t0 > 1.0:
                         self._writes_t0 = time.time()
@@ -1266,7 +1279,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.0.9')
+        self.title('死神vs火影 Yk修改器 1.0.10')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
