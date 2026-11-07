@@ -642,9 +642,10 @@ def defense_rate_for(mult):
 SEARCH_GAP = 0.0      # 空槽搜索间隔（0 = 每个 tick 都找）
 LEARN_GAP = 0.5       # 招式表重抓节流（秒）
 LEARN_RETRY = 0.25    # 候选没学满时的重试节流（秒，越小锁定越快）
-LEARN_RETRY_EMPTY = 0.08  # 还有空槽时的重试节流：候补/新局优先尽快学满
+LEARN_RETRY_EMPTY = 0.02  # 空槽期重试节流：与搜索节拍同频，单 worker 串行 + req 占位天然防重入
 FULL_FALLBACK = 0.3   # 锁满稳态下热点学不满回退全堆的节流（秒）
-EMPTY_FULL_FALLBACK = 0.8  # 空槽期热点学不满时的全堆兜底节流，兼顾冷启动锁人速度与 I/O 争用
+EMPTY_FULL_FALLBACK = 0.3  # 空槽期热点学不满时的全堆兜底节流（单 worker 下不会与找人重叠）
+EMPTY_DEEP_GAP = 0.6  # 空槽期全堆"发现"重试节流；首扫立即触发（见 _last_empty_deep 初值）
 GIL_YIELD_BYTES = 8 << 20   # 学习扫描每处理一块(8MB)就让出 GIL / 检查一次中止
 SLOW_GAP = 0.3        # 招式倍率写入间隔（秒）
 TICK_IDLE = 0.10      # 两边都锁住时的节拍
@@ -653,11 +654,11 @@ TICK_FAST = 0.015     # 有防御/气耗增益时的节拍（游戏每帧会重�
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yk_cache.json')
 WORKERS = max(2, min(8, (os.cpu_count() or 4)))
 MIN_HITS = 8          # 锁定门槛：真角色都在 15 条以上，5~7 条多半是学了一半
-DEAD_DEBOUNCE = 0.06  # 连续这么久读到 hp<=0 才判阵亡（仅滤瞬时读错，实际接近立即）
+DEAD_DEBOUNCE = 0.03  # 连续读到 hp<=0 才判阵亡（点读极稳，仅滤瞬时错读；实际接近立即）
 DROP_HOLD = 3.0       # 招式骤减判定退局需持续的秒数（单锁 / 双锁通用）
 OBJ_OFF = 0x78        # ScriptObject 指针比第一个字段（heavy）早 0x78 字节
 UI_GAP_MS = 1000      # 界面刷新间隔（毫秒）
-APP_VER = "1.1.2"
+APP_VER = "1.1.3"
 
 
 # ------------------------------------------------------------------ 引擎
@@ -706,7 +707,7 @@ class Engine:
         self._learnt = {}              # addr -> 最近一次学招式表的时间
         # 计时器 / 去抖
         self._last_deep = 0.0
-        self._last_empty_deep = 0.0     # 初值0=启动首次全堆发现立即放行；之后由 2s 节流约束
+        self._last_empty_deep = 0.0     # 初值0=启动首次全堆发现立即放行；之后由 EMPTY_DEEP_GAP 节流
         self._last_full_refresh = 0.0
         self._last_empty_full_learn = 0.0   # 空槽期静止真人的全堆学习兜底节流
         self._last_search = 0.0
@@ -749,7 +750,8 @@ class Engine:
         self.learn_cache = {}
         # 重置后立刻起算深扫周期：否则 _last_deep=0 会让第一扫满足">12s"而走 700ms 深扫
         self._last_deep = time.time()
-        self._last_empty_deep = time.time()
+        # 空槽全堆发现首扫立即触发（0.0 即满足 >EMPTY_DEEP_GAP），不等一个节流周期
+        self._last_empty_deep = 0.0
         self._last_full_refresh = 0.0
         self._last_empty_full_learn = 0.0
         self._last_search = 0.0
@@ -963,7 +965,7 @@ class Engine:
                 self._conn_t = 0.0
                 return
             # 发现型全堆不挂 abort：它本就运行在空槽期，中止它等于永远发现不了新区域
-            if time.time() - self._last_empty_deep > 2.0:
+            if time.time() - self._last_empty_deep > EMPTY_DEEP_GAP:
                 self._last_empty_deep = time.time()
                 mem._regions = None
                 found = scan_fighters(mem, deep=True)
@@ -1328,7 +1330,7 @@ class App(tk.Tk):
     def __init__(self, eng: Engine):
         super().__init__()
         self.eng = eng
-        self.title('死神vs火影 Yk修改器 1.1.2')
+        self.title('死神vs火影 Yk修改器 1.1.3')
         self.geometry('560x600')
         self.configure(bg='#1d1d1f')
         st = ttk.Style(self)
